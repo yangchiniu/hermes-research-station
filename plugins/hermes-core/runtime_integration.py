@@ -23,6 +23,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import random
 import sys
 import threading
 import time
@@ -671,7 +672,7 @@ class RuntimeHotPath:
         # --------------------------------------------------------------
         # STEP 11: Learning Loop — Reflection → Experience → Preference
         # --------------------------------------------------------------
-        self._run_learning_loop(tool_name, tool_id, success, output, error, duration, ctx)
+        self._run_learning_loop(tool_name, tool_id, success, output, error, duration, ctx, memory_context=memory_context)
 
         # --------------------------------------------------------------
         # STEP 12: Update GoalManager status
@@ -684,7 +685,69 @@ class RuntimeHotPath:
                     result_summary=output[:500] if success else error,
                 )
         except Exception as exc:
-            logger.debug("runtime: ------------------------------------------------------------: %s", exc)
+            logger.debug("runtime: GoalManager update: %s", exc)
+
+        # --------------------------------------------------------------
+        # STEP 12b: TaskGraph — record tool call as task node
+        # --------------------------------------------------------------
+        try:
+            if self._task_graph is not None and hasattr(self._task_graph, "add_node"):
+                _tg_mod = sys.modules.get("task_graph")
+                if _tg_mod is not None and hasattr(_tg_mod, "TaskNode"):
+                    from datetime import datetime, timezone as _tz
+                    _now = datetime.now(_tz.utc).isoformat()
+                    _node_id = f"hp_{tool_id}"
+                    _graph_id = f"session_{ctx.get('session_id', 'default')}"
+                    if not hasattr(self, "_session_graph_id"):
+                        self._session_graph_id = None
+                    if self._session_graph_id is None:
+                        try:
+                            self._session_graph_id = self._task_graph.create_graph(
+                                name=_graph_id, nodes=[],
+                            )
+                        except Exception:
+                            self._session_graph_id = _graph_id
+                    _node = _tg_mod.TaskNode(
+                        node_id=_node_id,
+                        action=tool_name,
+                        params={"args_keys": list(args.keys())},
+                        depends_on=[],
+                        status="completed" if success else "failed",
+                        result={"output_len": len(output)} if success else None,
+                        error=error[:200] if error else None,
+                        started_at=_now,
+                        completed_at=_now,
+                    )
+                    self._task_graph.add_node(self._session_graph_id, _node)
+        except Exception as exc:
+            logger.debug("runtime: TaskGraph add_node: %s", exc)
+
+        # --------------------------------------------------------------
+        # STEP 12c: Watchdog deadlock check (~10% sampling)
+        # --------------------------------------------------------------
+        try:
+            if random.random() < 0.1:
+                if self._watchdog is not None and hasattr(self._watchdog, "check_deadlocks"):
+                    deadlocks = self._watchdog.check_deadlocks()
+                    if deadlocks:
+                        logger.warning("runtime: watchdog detected %d deadlocks", len(deadlocks))
+        except Exception as exc:
+            logger.debug("runtime: Watchdog deadlock check: %s", exc)
+
+        # --------------------------------------------------------------
+        # STEP 12d: SelfObservation (~5% sampling)
+        # --------------------------------------------------------------
+        try:
+            if random.random() < 0.05:
+                if self._self_obs is not None and hasattr(self._self_obs, "run_once"):
+                    report = self._self_obs.run_once()
+                    if report and hasattr(report, "alerts") and report.alerts:
+                        logger.warning(
+                            "runtime: self-obs alerts: %s",
+                            "; ".join(report.alerts[:3]),
+                        )
+        except Exception as exc:
+            logger.debug("runtime: SelfObservation run_once: %s", exc)
 
         # --------------------------------------------------------------
         # STEP 13: Publish completion event
@@ -745,15 +808,15 @@ class RuntimeHotPath:
         try:
             goal = ctx.get("goal", "") or args.get("goal", "") or tool_name
 
-            # 1. Retrieve relevant semantic memories
-            if hasattr(self._memory, "search_semantic"):
-                results = self._memory.search_semantic(query=goal, limit=5)
+            # 1. Retrieve relevant episodic memories (semantic search)
+            if hasattr(self._memory, "recall_episodes"):
+                results = self._memory.recall_episodes(query=goal, limit=5)
                 if results:
                     memory_context["retrieved_memories"] = results
 
             # 2. Retrieve similar failures from episodic memory
-            if hasattr(self._memory, "search_episodic"):
-                failures = self._memory.search_episodic(
+            if hasattr(self._memory, "recall_episodes"):
+                failures = self._memory.recall_episodes(
                     query=f"failed {tool_name}", limit=3
                 )
                 if failures:
@@ -857,31 +920,46 @@ class RuntimeHotPath:
                     self._memory.prune()
                 logger.info("runtime: active defense — pruned memory")
             except Exception as exc:
-                logger.debug("runtime: _apply_active_defense: -------------------------------------: %s", exc)
+                logger.debug("runtime: active defense prune_memory: %s", exc)
 
         elif action == "reset_planner_weights" and self._planner is not None:
             try:
                 if hasattr(self._planner, "_strategy_preferences"):
                     self._planner._strategy_preferences = []
-                logger.info("runtime: active defense — reset planner weights")
+                if hasattr(self._planner, "_tool_preferences"):
+                    self._planner._tool_preferences = {}
+                # Remove persisted preferences file
+                _prefs_path = os.path.join(
+                    os.path.expanduser("~/.hermes/core/data"),
+                    "planner_preferences.json",
+                )
+                if os.path.exists(_prefs_path):
+                    os.remove(_prefs_path)
+                logger.info("runtime: active defense — reset planner weights + persisted prefs")
             except Exception as exc:
-                logger.debug("runtime: _apply_active_defense: -------------------------------------: %s", exc)
+                logger.debug("runtime: active defense reset_planner_weights: %s", exc)
 
         elif action == "throttle_eventbus":
             try:
-                if self._event_bus is not None and hasattr(self._event_bus, "set_throttle"):
-                    self._event_bus.set_throttle(True)
-                logger.info("runtime: active defense — throttled EventBus")
+                if self._event_bus is not None:
+                    if hasattr(self._event_bus, "set_rate_limit"):
+                        self._event_bus.set_rate_limit(max_events_per_second=5)
+                        logger.info("runtime: active defense — throttled EventBus via rate limit")
+                    else:
+                        logger.info("runtime: active defense — EventBus throttle skipped (no set_rate_limit)")
             except Exception as exc:
-                logger.debug("runtime: _apply_active_defense: -------------------------------------: %s", exc)
+                logger.debug("runtime: active defense throttle_eventbus: %s", exc)
 
         elif action == "reduce_reflection_frequency" and self._reflection is not None:
+            # ReflectionEngine has no set_frequency(); log diagnostic instead
             try:
-                if hasattr(self._reflection, "set_frequency"):
-                    self._reflection.set_frequency(0.1)  # 10% frequency
-                logger.info("runtime: active defense — reduced reflection frequency")
+                stats = self._reflection.get_stats() if hasattr(self._reflection, "get_stats") else {}
+                logger.info(
+                    "runtime: active defense — reflection diagnostic (freq reduction unavailable): %s",
+                    stats,
+                )
             except Exception as exc:
-                logger.debug("runtime: unknown: %s", exc)
+                logger.debug("runtime: active defense reduce_reflection: %s", exc)
 
         elif action == "recovery" and self._kernel is not None:
             try:
@@ -889,7 +967,7 @@ class RuntimeHotPath:
                     self._kernel.recover()
                 logger.info("runtime: active defense — triggered recovery")
             except Exception as exc:
-                logger.debug("runtime: unknown: %s", exc)
+                logger.debug("runtime: active defense recovery: %s", exc)
 
     # ------------------------------------------------------------------
     # Learning Loop — Reflection → Experience → Planner Preference
@@ -989,13 +1067,27 @@ class RuntimeHotPath:
                     prefs[tool_name] = min(1.0, current + 0.05)
                 else:
                     prefs[tool_name] = max(0.0, current - 0.05)
+                # Persist to disk so learning survives restarts
+                try:
+                    _prefs_path = os.path.join(
+                        os.path.expanduser("~/.hermes/core/data"),
+                        "planner_preferences.json",
+                    )
+                    os.makedirs(os.path.dirname(_prefs_path), exist_ok=True)
+                    with open(_prefs_path, "w") as _f:
+                        json.dump(
+                            {k: round(v, 4) for k, v in prefs.items()},
+                            _f, indent=2,
+                        )
+                except Exception as exc:
+                    logger.debug("runtime: prefs persist: %s", exc)
         except Exception as exc:
             logger.debug("runtime: Planner preference update: %s", exc)
 
         # --- 4. Memory consolidation ---
         try:
-            if self._memory is not None and hasattr(self._memory, "store_episodic"):
-                self._memory.store_episodic(
+            if self._memory is not None and hasattr(self._memory, "remember_episode"):
+                self._memory.remember_episode(
                     description=f"Tool execution: {tool_name}",
                     summary=output[:500] if success else error,
                     outcome="success" if success else "failure",

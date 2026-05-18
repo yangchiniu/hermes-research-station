@@ -14,6 +14,8 @@ from __future__ import annotations
 
 import json
 import logging
+import random
+import sys
 import time
 from typing import Any, Optional
 
@@ -100,8 +102,8 @@ def on_session_start(session_id: str = "", **_: Any) -> None:
                 {"session_id": session_id},
                 severity="info",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("hermes-core: session.start event logging: %s", exc)
 
     # Start telemetry background collection
     if _telemetry is not None and not _telemetry_started:
@@ -109,8 +111,8 @@ def on_session_start(session_id: str = "", **_: Any) -> None:
             _telemetry.start(interval_s=60.0)
             _telemetry_started = True
             logger.debug("hermes-core: telemetry started")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("hermes-core: telemetry start: %s", exc)
 
     # --- NEW: Register EventBus listeners for cross-module signalling ---
     try:
@@ -121,18 +123,18 @@ def on_session_start(session_id: str = "", **_: Any) -> None:
             try:
                 import event_bus
 
-                bus = event_bus.get_event_bus()
+                bus = event_bus.get_bus()
                 if bus and hasattr(bus, "subscribe"):
                     bus.subscribe("tool.completed", _on_tool_completed_event)
                     bus.subscribe("tool.failed", _on_tool_failed_event)
                     bus.subscribe("recovery.triggered", _on_recovery_event)
                     logger.info("hermes-core: registered EventBus listeners")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("hermes-core: EventBus listener registration: %s", exc)
             finally:
                 _core_off_path()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("hermes-core: EventBus setup outer: %s", exc)
 
     logger.info("hermes-core: session %s started", session_id)
 
@@ -160,8 +162,8 @@ def _on_tool_completed_event(event_data: dict) -> None:
                 {"tool": tool, "task_id": task_id, "duration_s": duration},
                 severity="info",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("hermes-core: eventlogger tool.completed: %s", exc)
 
 
 def _on_tool_failed_event(event_data: dict) -> None:
@@ -208,10 +210,10 @@ def _on_tool_failed_event(event_data: dict) -> None:
                         logger.info(
                             "hermes-core: triggered self-observation after failure in %s mode", mode,
                         )
-                except Exception:
-                    pass
-    except Exception:
-        pass
+                except Exception as exc:
+                    logger.debug("hermes-core: self_obs run_once in tool.failed handler: %s", exc)
+    except Exception as exc:
+        logger.debug("hermes-core: tool.failed handler: %s", exc)
 
 
 def _on_recovery_event(event_data: dict) -> None:
@@ -233,8 +235,8 @@ def _on_recovery_event(event_data: dict) -> None:
                         "hermes-core: post-recovery alerts: %s",
                         "; ".join(report.alerts[:3]),
                     )
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("hermes-core: post-recovery self_observation: %s", exc)
 
     # Log recovery event
     if _event_logger is not None:
@@ -244,8 +246,8 @@ def _on_recovery_event(event_data: dict) -> None:
                 {"event": event_data},
                 severity="info",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("hermes-core: eventlogger recovery event: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -311,15 +313,15 @@ def pre_tool_call(
                     tool_name, reason,
                 )
                 return {"action": "block", "message": f"[PolicyDenied] {reason}"}
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("hermes-core: PolicyEngine check: %s", exc)
 
     # ---- 2. WorldModel snapshot (async, best-effort) ----
     try:
         if _runtime._world_model is not None:
             _runtime._world_model.get_world_state(refresh=True)
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("hermes-core: WorldModel snapshot: %s", exc)
 
     # ---- 3. Telemetry record_attempt ----
     try:
@@ -328,18 +330,18 @@ def pre_tool_call(
                 _telemetry.record_tool_attempt(tool_name=tool_name)
             elif hasattr(_telemetry, "collect"):
                 _telemetry.collect()
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("hermes-core: Telemetry record_attempt: %s", exc)
 
     # ---- 4. Watchdog deadlock check (periodic ~10%) ----
     try:
-        if hash(tool_call_id or tool_name) % 10 == 0:
+        if random.random() < 0.1:
             if _runtime._watchdog is not None and hasattr(_runtime._watchdog, "check_deadlocks"):
                 deadlocks = _runtime._watchdog.check_deadlocks()
                 if deadlocks:
                     logger.warning("hermes-core: watchdog detected %d deadlocks", len(deadlocks))
-    except Exception:
-        pass
+    except Exception as exc:
+        logger.debug("hermes-core: Watchdog deadlock check: %s", exc)
 
     return None  # Allow execution
 
@@ -401,8 +403,8 @@ def post_tool_call(
                 },
                 severity="info",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("hermes-core: eventlogger tool.call: %s", exc)
 
     # ---- 2. RuntimeHotPath post-execution pipeline ----
     _ensure_runtime()
@@ -448,8 +450,8 @@ def post_tool_call(
                     _telemetry.record_tool(tool_name=tool_name, success=success)
                 elif hasattr(_telemetry, "collect"):
                     _telemetry.collect()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("hermes-core: Telemetry record_tool: %s", exc)
 
         # 2b. Retrieve memory context for learning loop
         memory_ctx = {}
@@ -458,8 +460,8 @@ def post_tool_call(
                 memory_ctx = _runtime._retrieve_memory_context(
                     tool_name, args or {}, {"goal": tool_name, "domain": "general"},
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("hermes-core: memory context retrieval: %s", exc)
 
         # 2c. Learning loop: Reflection → Experience → Memory
         try:
@@ -475,12 +477,12 @@ def post_tool_call(
                     ctx={"goal": tool_name, "domain": "general"},
                     memory_context=memory_ctx,
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("hermes-core: learning loop: %s", exc)
 
         # 2d. Drift analysis (periodic, not every call — sample rate ~10%)
         try:
-            if hash(tool_call_id or tool_name) % 10 == 0:  # 10% sampling
+            if random.random() < 0.1:  # 10% sampling
                 if hasattr(_runtime, "_drift") and _runtime._drift is not None:
                     # DriftAnalyzer has analyze_all(), not observe()
                     if hasattr(_runtime._drift, "get_summary"):
@@ -492,8 +494,8 @@ def post_tool_call(
                     if drift and drift.get("action_required"):
                         if hasattr(_runtime, "_apply_active_defense"):
                             _runtime._apply_active_defense(drift)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("hermes-core: drift analysis: %s", exc)
 
         # 2e. TaskGraph — record tool call as task node (lazy graph creation)
         try:
@@ -508,7 +510,9 @@ def post_tool_call(
                     _runtime._session_graph_id = None
                 if _runtime._session_graph_id is None:
                     try:
-                        from .task_graph import TaskNode, TaskGraphEngine
+                        _tg_mod = sys.modules.get("task_graph")
+                        if _tg_mod is None:
+                            raise ImportError("task_graph not loaded")
                         _runtime._session_graph_id = _runtime._task_graph.create_graph(
                             name=_graph_id, nodes=[],
                         )
@@ -516,7 +520,10 @@ def post_tool_call(
                         _runtime._session_graph_id = _graph_id
                 # Record as completed node
                 try:
-                    from .task_graph import TaskNode
+                    _tg_mod = sys.modules.get("task_graph")
+                    if _tg_mod is None:
+                        raise ImportError("task_graph not loaded")
+                    TaskNode = _tg_mod.TaskNode
                     _node = TaskNode(
                         node_id=_node_id,
                         action=tool_name,
@@ -529,14 +536,14 @@ def post_tool_call(
                         completed_at=_now,
                     )
                     _runtime._task_graph.add_node(_runtime._session_graph_id, _node)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+                except Exception as exc:
+                    logger.debug("hermes-core: TaskGraph add_node: %s", exc)
+        except Exception as exc:
+            logger.debug("hermes-core: TaskGraph record: %s", exc)
 
         # 2f. SelfObservation — periodic deep analysis (~5% sampling)
         try:
-            if hash(tool_call_id or tool_name) % 20 == 0:  # 5% sampling
+            if random.random() < 0.05:  # 5% sampling
                 if _runtime._self_obs is not None and hasattr(_runtime._self_obs, "run_once"):
                     report = _runtime._self_obs.run_once()
                     if report and hasattr(report, "alerts") and report.alerts:
@@ -544,8 +551,28 @@ def post_tool_call(
                             "hermes-core: self-obs alerts: %s",
                             "; ".join(report.alerts[:3]),
                         )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("hermes-core: SelfObservation run_once: %s", exc)
+
+        # 2g. EventBus publish — tool.completed / tool.failed
+        try:
+            _pub_bus = None
+            _eb_mod = sys.modules.get("event_bus")
+            if _eb_mod is not None and hasattr(_eb_mod, "get_bus"):
+                _pub_bus = _eb_mod.get_bus()
+            if _pub_bus is not None and hasattr(_pub_bus, "publish"):
+                _pub_bus.publish(
+                    "tool.completed" if success else "tool.failed",
+                    {
+                        "tool": tool_name,
+                        "task_id": task_id or tool_call_id,
+                        "duration_s": round(_duration, 3),
+                        "success": success,
+                        "error": error[:200] if error else "",
+                    },
+                )
+        except Exception as exc:
+            logger.debug("hermes-core: EventBus publish: %s", exc)
 
     except Exception as exc:
         logger.debug("hermes-core: post_tool_call runtime pipeline error: %s", exc)
@@ -589,16 +616,16 @@ def post_llm_call(
                 },
                 severity="info",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("hermes-core: eventlogger llm.call: %s", exc)
 
     # Pass latency to telemetry
     if _telemetry is not None and duration_ms > 0:
         try:
             if hasattr(_telemetry, "record_llm_latency"):
                 _telemetry.record_llm_latency(duration_ms / 1000.0)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("hermes-core: Telemetry record_llm_latency: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -628,8 +655,8 @@ def on_session_end(
     if _runtime is not None:
         try:
             runtime_telemetry = _runtime.get_runtime_telemetry()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("hermes-core: runtime telemetry snapshot: %s", exc)
 
     stability_score = runtime_telemetry.get("current_stability", 0.0)
     behavior_mode = runtime_telemetry.get("behavior_mode", "unknown")
@@ -653,15 +680,15 @@ def on_session_end(
                 },
                 severity="info",
             )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("hermes-core: eventlogger session.end: %s", exc)
 
     # Collect final telemetry snapshot
     if _telemetry is not None:
         try:
             _telemetry.collect()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("hermes-core: telemetry collect: %s", exc)
 
     logger.info(
         "hermes-core: session %s ended (%.1fs, stability=%.2f, mode=%s)",
