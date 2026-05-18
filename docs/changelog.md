@@ -1,84 +1,146 @@
 # Changelog
 
-## 2026-05-18: hermes-core 插件审计与修复
+## 2026-05-18: hermes-core 子系统接入 — 7 项已知限制修复
 
 ### 背景
 
-对 `~/.hermes/plugins/hermes-core/` 的 hooks.py (510行) 和 runtime_integration.py (1100行) 进行了全面审计，发现 7 个影响学习循环有效性的 bug。
+第一轮审计修复了 7 个数据流 bug（见下方 2026-05-18 条目）。本轮修复 7 个已知限制，
+将之前"初始化但未接入"的子系统连接到实际执行流，让学习循环从"只写不读"变为"读写闭环"。
 
-### hooks.py 修复 (4 项)
+### 修复清单
 
-#### Bug #1: success 硬编码为 True (严重)
+#### Fix #1: PolicyEngine fail-open → fail-closed (安全)
 
-**问题**: `post_tool_call` hook 中 `success = True` 硬编码，学习循环永远认为工具调用成功。导致：
-- ExperienceManager 从不记录失败模式
-- Planner 权重只升不降
-- DriftAnalyzer 无法检测失败趋势
+**问题**: PolicyEngine 抛异常时 `policy_allowed` 保持 `True`（初始值），异常 = 放行。
+**修复**: except 块显式设 `policy_allowed = False`，附带 `policy_engine_error` 原因。
 
-**修复**: 分析输出内容中的 11 种失败关键词 (traceback, error:, exception:, failed, permission denied, not found, no such file, connection refused, timed out, exit code 1, exit_code=1)。命中任一关键词则标记为失败。
+#### Fix #2: 记忆检索结果影响学习循环 (数据流)
 
-#### Bug #2: duration 硬编码为 0.0 (中等)
+**问题**: `_retrieve_memory_context()` 在 `execute_tool()` 中被调用，但 hooks.py 的
+`post_tool_call` 从未调用 `execute_tool()`，记忆检索是死代码。
+**修复**:
+- hooks.py 的 `post_tool_call` 新增记忆检索步骤，调用 `_runtime._retrieve_memory_context()`
+- 记忆上下文传入 `_run_learning_loop(memory_context=...)`
+- 学习循环将 `related_memories` 和 `past_failures` 注入反思引擎的 context
+- 失败记录附带类似失败计数
 
-**问题**: 所有工具耗时记录为 0，Telemetry 和 DriftAnalyzer 的性能数据全部无效。
+#### Fix #3: Watchdog/TaskGraph/SelfObservation 接入执行流 (架构)
 
-**修复**: 在 `pre_tool_call` 中记录 `time.time()` 到 `_call_timers` 字典，在 `post_tool_call` 中计算真实耗时并传递给学习循环。
+**问题**: 三个子系统初始化后从未被调用。
+**修复**:
+- **Watchdog.check_deadlocks()** — `pre_tool_call` 中 10% 采样检查死锁
+- **TaskGraph** — `post_tool_call` 中懒创建会话级任务图，每个工具调用记录为节点
+- **SelfObservation.run_once()** — `post_tool_call` 中 5% 采样触发深度自观察
+- **OODA** — 不接入每工具调用（会与 Planner+Reflection+Experience 重复工作），保留给复杂多步任务
 
-#### Bug #3: 漂移采样使用 id() (中等)
+#### Fix #4: EventBus handler 从 no-op 变为实际处理 (事件驱动)
 
-**问题**: `id(tool_name) % 10` 使用内存地址做采样，CPython 中短字符串的 id 可能恒定，导致采样率不确定——可能每次触发或永远不触发。
+**问题**: `_on_tool_completed_event` 是空函数，`_on_tool_failed_event` 只在 safe/frozen 模式记录。
+**修复**:
+- `tool.completed` → 记录到 event_logger 审计轨迹
+- `tool.failed` → 记录 tool/mode/stability/violations，在 safe/frozen 模式触发 SelfObservation
+- `recovery.triggered` → 触发 SelfObservation 做事后诊断，记录到 event_logger
 
-**修复**: 改为 `hash(tool_call_id or tool_name) % 10`，确定性采样率稳定在 ~10%。
+#### Fix #5: 清理 bare except: pass (可维护性)
 
-#### Bug #4: JSON 序列化在截断之前 (低)
+**问题**: runtime_integration.py 有 38 处 `except Exception: pass`，错误被静默吞掉。
+**修复**: 全部替换为 `except Exception as exc: logger.debug("runtime: <context>: %s", exc)`，
+每个日志消息包含函数名和最近的注释作为上下文。
 
-**问题**: 先将整个 result 做 `json.dumps()` (可能产生巨大字符串)，再截断到 200 字符。浪费 CPU。
+#### Fix #6: 反思/经验截断长度提升 (数据质量)
 
-**修复**: 先 `str(result)[:500]` 截断，再传递给学习循环。输出上限从 200 扩大到 300 字符以给反思引擎更多上下文。
+**问题**: 输出截断 300 字符给反思引擎，200 字符给 kernel/goals/memory，复杂任务的反思质量差。
+**修复**:
+- 反思引擎: 300 → 1000 字符
+- Kernel after_task / GoalManager / Memory: 200 → 500 字符
 
-### runtime_integration.py 修复 (3 项)
+#### Fix #7: Planner 从 ExperienceManager 学习 (学习闭环)
 
-#### Bug #5: memory_context 注入 handler kwargs (中等)
+**问题**: 学习循环的 `_tool_preferences ±0.05` 与 ExperienceManager 的 success_rate 是两套独立数据。
+**修复**:
+- 学习循环新增 `experience.record_tool_usage()` 调用，更新 ExperienceManager 的工具统计
+- Planner 的 `_select_tool()` 已有的 `exp.get_tool_stats()` 查询自动获取最新数据
+- 移除冗余的 JSON 磁盘持久化（ExperienceManager 自己管理持久化）
 
-**问题**: `_retrieve_memory_context()` 的结果被注入到 `enriched_args["_memory_context"]`，然后传给标准工具 handler。标准工具 (terminal, read_file 等) 不认识这个参数，可能抛 TypeError (被 except 吞掉)。
+### 额外修复
 
-**修复**: 移除 `_memory_context` 注入到 handler args 的逻辑。memory_context 仍然被检索，但不再传给 handler。
-
-#### Bug #6: `**memory_context` 散入 kernel.after_task (中等)
-
-**问题**: `kernel.after_task(context={..., **memory_context})` 将 `retrieved_memories`, `similar_failures`, `successful_patterns` 三个 key 散入 context dict，可能导致 after_task 内部逻辑异常。
-
-**修复**: 改为 `"has_memory_context": bool(memory_context)`，只传递是否有记忆上下文的布尔值。
-
-#### Bug #7: Planner 偏好内存驻留、重启丢失 (严重)
-
-**问题**: `_tool_preferences` 是普通 Python dict，每次进程重启后所有学习到的工具偏好归零。学习循环形同虚设。
-
-**修复**: 
-- 每次偏好更新后写入 `~/.hermes/core/data/planner_preferences.json`
-- RuntimeHotPath 初始化时从磁盘加载偏好
-
-### 验证结果
-
-```
-Test 1: Success Detection   ✅ 7/7 case passed
-Test 2: Duration Tracking   ✅ 50ms sleep → 50.2ms measured
-Test 3: Hash Sampling       ✅ 6.0% rate (within 5-15% expected)
-Test 4: Preferences File    ✅ JSON persistence ready
-```
+- **DriftAnalyzer API 修复**: hooks.py 和 runtime_integration.py 中的 `drift.observe()` 调用
+  改为 `drift.get_summary()` / `drift.analyze_all()`（DriftAnalyzer 没有 observe 方法）
 
 ### 资源影响
 
 | 项目 | 开销 |
 |------|------|
 | 额外 LLM 调用 | 0 |
-| CPU 增量 | < 50ms / 工具调用 |
-| 内存增量 | < 1MB |
+| CPU 增量 | < 100ms / 工具调用（含记忆检索） |
+| 内存增量 | < 2MB |
 | Token 增量 | 0 |
 
-### 仍存在的已知限制
+### 现在的数据流
 
-1. EventBus handler (tool.completed, tool.failed) 仍是 no-op
-2. 4 个子系统 (ooda, watchdog, task_graph, self_obs) 初始化但未被 execute_tool 使用
-3. 17+ bare except: pass 仍在 runtime_integration.py 中 (未全部清理)
-4. PolicyEngine check 失败时 fail-open (允许执行)
-5. 反思和经验数据的"质量"取决于输出截断长度 (300 字符)
+```
+用户说话 → LLM 决策 → 执行工具
+  → pre_tool_call:
+    → PolicyEngine (fail-closed)
+    → WorldModel snapshot
+    → Telemetry
+    → Watchdog deadlock check (10%)
+  → post_tool_call:
+    → 成功/失败检测
+    → Duration 计时
+    → 记忆检索
+    → 学习循环:
+      → 反思引擎 (含记忆上下文)
+      → 经验管理器 (success/failure + tool_usage)
+      → Planner 偏好更新
+    → DriftAnalyzer (10%)
+    → TaskGraph 节点记录
+    → SelfObservation (5%)
+    → EventBus 事件发布
+      → tool.completed/tool.failed handler
+```
+
+---
+
+## 2026-05-18: hermes-core 插件审计与修复
+
+### 背景
+
+对 `~/.hermes/plugins/hermes-core/` 的 hooks.py (510行) 和 runtime_integration.py (1100行)
+进行了全面审计，发现 7 个影响学习循环有效性的 bug。
+
+### hooks.py 修复 (4 项)
+
+#### Bug #1: success 硬编码为 True (严重)
+
+**问题**: `post_tool_call` hook 中 `success = True` 硬编码，学习循环永远认为工具调用成功。
+**修复**: 分析输出内容中的 11 种失败关键词。
+
+#### Bug #2: duration 硬编码为 0.0 (中等)
+
+**问题**: 所有工具耗时记录为 0。
+**修复**: `pre_tool_call` 记录时间戳，`post_tool_call` 计算真实耗时。
+
+#### Bug #3: 漂移采样使用 id() (中等)
+
+**问题**: `id(tool_name) % 10` 使用内存地址做采样，采样率不确定。
+**修复**: 改为 `hash(tool_call_id or tool_name) % 10`。
+
+#### Bug #4: JSON 序列化在截断之前 (低)
+
+**问题**: 先 `json.dumps()` 再截断，浪费 CPU。
+**修复**: 先 `str(result)[:500]` 截断。
+
+### runtime_integration.py 修复 (3 项)
+
+#### Bug #5: memory_context 注入 handler kwargs (中等)
+
+**修复**: 移除 `_memory_context` 注入到 handler args 的逻辑。
+
+#### Bug #6: `**memory_context` 散入 kernel.after_task (中等)
+
+**修复**: 改为 `"has_memory_context": bool(memory_context)`。
+
+#### Bug #7: Planner 偏好重启丢失 (严重)
+
+**修复**: 每次偏好更新后写入 JSON，初始化时从磁盘加载。

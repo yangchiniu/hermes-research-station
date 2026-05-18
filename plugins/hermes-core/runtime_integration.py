@@ -78,13 +78,13 @@ def _get_kernel():
     if m and hasattr(m, "get_kernel"):
         try:
             return m.get_kernel()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: _get_kernel: Check if already in sys.modules (imported as si: %s", exc)
     if m and hasattr(m, "AgentKernel"):
         try:
             return m.AgentKernel()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: _get_kernel: Check if already in sys.modules (imported as si: %s", exc)
     return None
 
 
@@ -93,8 +93,8 @@ def _get_planner():
     if m and hasattr(m, "get_planner"):
         try:
             return m.get_planner()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: _get_planner: %s", exc)
     return None
 
 
@@ -103,8 +103,8 @@ def _get_ooda():
     if m and hasattr(m, "get_ooda"):
         try:
             return m.get_ooda()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: _get_ooda: %s", exc)
     return None
 
 
@@ -113,8 +113,8 @@ def _get_telemetry():
     if m and hasattr(m, "Telemetry"):
         try:
             return m.Telemetry()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: _get_telemetry: %s", exc)
     return None
 
 
@@ -123,8 +123,8 @@ def _get_policy():
     if m and hasattr(m, "get_policy_engine"):
         try:
             return m.get_policy_engine()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: _get_policy: %s", exc)
     return None
 
 
@@ -133,8 +133,8 @@ def _get_world_model():
     if m and hasattr(m, "get_world_model"):
         try:
             return m.get_world_model()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: _get_world_model: %s", exc)
     return None
 
 
@@ -153,8 +153,8 @@ def _get_reflection():
     if m and hasattr(m, "get_reflection"):
         try:
             return m.get_reflection()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: _get_reflection: %s", exc)
     return None
 
 
@@ -163,8 +163,8 @@ def _get_experience():
     if m and hasattr(m, "get_experience"):
         try:
             return m.get_experience()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: _get_experience: %s", exc)
     return None
 
 
@@ -173,8 +173,8 @@ def _get_memory_manager():
     if m and hasattr(m, "MemoryManager"):
         try:
             return m.MemoryManager()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: _get_memory_manager: %s", exc)
     return None
 
 
@@ -183,8 +183,8 @@ def _get_drift():
     if m and hasattr(m, "get_drift_analyzer"):
         try:
             return m.get_drift_analyzer()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: _get_drift: %s", exc)
     return None
 
 
@@ -193,8 +193,8 @@ def _get_watchdog():
     if m and hasattr(m, "Watchdog"):
         try:
             return m.Watchdog()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: _get_watchdog: %s", exc)
     return None
 
 
@@ -203,8 +203,8 @@ def _get_goal_manager():
     if m and hasattr(m, "GoalManager"):
         try:
             return m.GoalManager()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: _get_goal_manager: %s", exc)
     return None
 
 
@@ -213,8 +213,8 @@ def _get_supervisor():
     if m and hasattr(m, "get_supervisor"):
         try:
             return m.get_supervisor()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: _get_supervisor: %s", exc)
     return None
 
 
@@ -224,13 +224,13 @@ def _get_self_obs():
         if hasattr(m, "get_self_observation"):
             try:
                 return m.get_self_observation()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("runtime: _get_self_obs: %s", exc)
         if hasattr(m, "SelfObservationLoop"):
             try:
                 return m.SelfObservationLoop()
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("runtime: _get_self_obs: %s", exc)
     return None
 
 
@@ -239,8 +239,8 @@ def _get_task_graph():
     if m and hasattr(m, "get_engine"):
         try:
             return m.get_engine()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: _get_task_graph: %s", exc)
     return None
 
 
@@ -414,22 +414,22 @@ class RuntimeHotPath:
         try:
             if self._supervisor and hasattr(self._supervisor, "start"):
                 self._supervisor.start()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: Start RuntimeSupervisor if available: %s", exc)
 
         # Start Watchdog if available
         try:
             if self._watchdog and hasattr(self._watchdog, "start"):
                 self._watchdog.start()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: Start Watchdog if available: %s", exc)
 
         # Start SelfObservation if available
         try:
             if self._self_obs and hasattr(self._self_obs, "start"):
                 self._self_obs.start()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: Start SelfObservation if available: %s", exc)
 
     # ------------------------------------------------------------------
     # PUBLIC API — the one method the agent should call
@@ -483,8 +483,8 @@ class RuntimeHotPath:
                     description=f"tool:{tool_name} - {goal_desc[:80]}",
                     priority=goal_priority,
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: ------------------------------------------------------------: %s", exc)
 
         # --------------------------------------------------------------
         # STEP 1: PolicyEngine.check_action()
@@ -505,7 +505,10 @@ class RuntimeHotPath:
                         "task_id": tool_id,
                     })
         except Exception as exc:
+            policy_allowed = False
+            policy_reason = f"policy_engine_error: {exc}"
             violations.append(f"policy_check_error: {exc}")
+            logger.warning("runtime: PolicyEngine exception, fail-closed: %s", exc)
 
         # If blocked, return immediately with audit trail
         if not policy_allowed:
@@ -620,8 +623,8 @@ class RuntimeHotPath:
                     )
                 elif hasattr(self._telemetry, "collect"):
                     self._telemetry.collect()
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: ------------------------------------------------------------: %s", exc)
 
         # --------------------------------------------------------------
         # STEP 9: Kernel after_task (if kernel available)
@@ -632,7 +635,7 @@ class RuntimeHotPath:
                     task_id=tool_id,
                     result={
                         "success": success,
-                        "summary": output[:200] if output else (error or "no output"),
+                        "summary": output[:500] if output else (error or "no output"),
                         "error": error or None,
                         "duration_s": duration,
                         "tools_used": [{"name": tool_name, "success": success}],
@@ -644,27 +647,26 @@ class RuntimeHotPath:
                         "has_memory_context": bool(memory_context),
                     },
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: ------------------------------------------------------------: %s", exc)
 
         # --------------------------------------------------------------
         # STEP 10: DriftAnalyzer Observe (active defense)
         # --------------------------------------------------------------
         drift_report = {}
         try:
-            if self._drift is not None and hasattr(self._drift, "observe"):
-                drift_report = self._drift.observe({
-                    "tool": tool_name,
-                    "success": success,
-                    "duration_s": duration,
-                    "task_id": tool_id,
-                })
+            if self._drift is not None:
+                # DriftAnalyzer has get_summary()/analyze_all(), not observe()
+                if hasattr(self._drift, "get_summary"):
+                    drift_report = self._drift.get_summary()
+                elif hasattr(self._drift, "analyze_all"):
+                    drift_report = self._drift.analyze_all()
                 # If drift detected, trigger active defense
                 if drift_report and drift_report.get("action_required"):
                     self._apply_active_defense(drift_report)
                     violations.append(f"drift_action: {drift_report.get('action', 'none')}")
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: If drift detected, trigger active defense: %s", exc)
 
         # --------------------------------------------------------------
         # STEP 11: Learning Loop — Reflection → Experience → Preference
@@ -679,10 +681,10 @@ class RuntimeHotPath:
                 self._goals.update_goal(
                     goal_id=tool_id,
                     status="completed" if success else "failed",
-                    result_summary=output[:200] if success else error,
+                    result_summary=output[:500] if success else error,
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: ------------------------------------------------------------: %s", exc)
 
         # --------------------------------------------------------------
         # STEP 13: Publish completion event
@@ -791,8 +793,8 @@ class RuntimeHotPath:
                         s = latest.cognitive_stability_score
                         if s is not None and s > 0:
                             return min(1.0, float(s))
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: _get_stability_score: --------------------------------------: %s", exc)
         return 1.0  # default: assume stable when no data
 
     def _compute_behavior_controls(self, stability: float) -> Dict[str, Any]:
@@ -854,40 +856,40 @@ class RuntimeHotPath:
                 if hasattr(self._memory, "prune"):
                     self._memory.prune()
                 logger.info("runtime: active defense — pruned memory")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("runtime: _apply_active_defense: -------------------------------------: %s", exc)
 
         elif action == "reset_planner_weights" and self._planner is not None:
             try:
                 if hasattr(self._planner, "_strategy_preferences"):
                     self._planner._strategy_preferences = []
                 logger.info("runtime: active defense — reset planner weights")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("runtime: _apply_active_defense: -------------------------------------: %s", exc)
 
         elif action == "throttle_eventbus":
             try:
                 if self._event_bus is not None and hasattr(self._event_bus, "set_throttle"):
                     self._event_bus.set_throttle(True)
                 logger.info("runtime: active defense — throttled EventBus")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("runtime: _apply_active_defense: -------------------------------------: %s", exc)
 
         elif action == "reduce_reflection_frequency" and self._reflection is not None:
             try:
                 if hasattr(self._reflection, "set_frequency"):
                     self._reflection.set_frequency(0.1)  # 10% frequency
                 logger.info("runtime: active defense — reduced reflection frequency")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("runtime: unknown: %s", exc)
 
         elif action == "recovery" and self._kernel is not None:
             try:
                 if hasattr(self._kernel, "recover"):
                     self._kernel.recover()
                 logger.info("runtime: active defense — triggered recovery")
-            except Exception:
-                pass
+            except Exception as exc:
+                logger.debug("runtime: unknown: %s", exc)
 
     # ------------------------------------------------------------------
     # Learning Loop — Reflection → Experience → Planner Preference
@@ -902,6 +904,7 @@ class RuntimeHotPath:
         error: str,
         duration: float,
         ctx: Dict[str, Any],
+        memory_context: Optional[Dict[str, Any]] = None,
     ) -> None:
         """Run the post-execution learning loop.
 
@@ -911,27 +914,33 @@ class RuntimeHotPath:
             3. Planner preference update — adjust future strategy weights
         """
         goal = ctx.get("goal", "") or tool_name
+        mem = memory_context or {}
 
-        # --- 1. Reflection ---
+        # --- 1. Reflection (now with memory context) ---
         reflection_id = ""
         try:
             if self._reflection is not None and hasattr(self._reflection, "reflect_on_task"):
+                reflection_ctx = dict(ctx)
+                if mem.get("retrieved_memories"):
+                    reflection_ctx["related_memories"] = mem["retrieved_memories"][:3]
+                if mem.get("similar_failures"):
+                    reflection_ctx["past_failures"] = mem["similar_failures"][:3]
                 reflection_id = self._reflection.reflect_on_task(
                     task_id=task_id,
                     goal=goal,
                     result={
                         "success": success,
-                        "summary": (output[:300] if output else (error or "no output")),
+                        "summary": (output[:1000] if output else (error or "no output")),
                         "error": error or None,
                         "duration_s": duration,
                         "tools_used": [tool_name],
                     },
-                    context=ctx,
+                    context=reflection_ctx,
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: --- 1. Reflection (now with memory context) ---: %s", exc)
 
-        # --- 2. Experience update with confidence ---
+        # --- 2. Experience update with confidence (now with failure patterns) ---
         try:
             if self._experience is not None:
                 domain = ctx.get("domain", "general")
@@ -948,16 +957,31 @@ class RuntimeHotPath:
                         )
                 else:
                     if hasattr(self._experience, "record_failure"):
+                        # Enrich failure with similar past failures
+                        error_msg = error or "Unknown error"
+                        similar = mem.get("similar_failures", [])
+                        if similar:
+                            error_msg += f" [similar past failures: {len(similar)}]"
                         self._experience.record_failure(
                             domain=domain,
                             error_type=f"tool_failure:{tool_name}",
-                            error_message=error or "Unknown error",
+                            error_message=error_msg,
                         )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: Enrich failure with similar past failures: %s", exc)
 
-        # --- 3. Planner preference update ---
+        # --- 3. Planner preference update (via ExperienceManager) ---
         try:
+            if self._experience is not None and hasattr(self._experience, "record_tool_usage"):
+                # Record tool usage in ExperienceManager — this feeds into
+                # Planner._select_tool() via exp.get_tool_stats()
+                self._experience.record_tool_usage(
+                    tool_name=tool_name,
+                    domain=ctx.get("domain", "general"),
+                    success=success,
+                    duration_s=duration,
+                )
+            # Also update in-memory planner preferences for immediate effect
             if self._planner is not None and hasattr(self._planner, "_tool_preferences"):
                 prefs = self._planner._tool_preferences
                 current = prefs.get(tool_name, 0.5)
@@ -965,31 +989,20 @@ class RuntimeHotPath:
                     prefs[tool_name] = min(1.0, current + 0.05)
                 else:
                     prefs[tool_name] = max(0.0, current - 0.05)
-                # Persist preferences to disk
-                try:
-                    import json as _json
-                    _prefs_path = os.path.join(
-                        os.path.expanduser("~/.hermes/core/data"),
-                        "planner_preferences.json",
-                    )
-                    with open(_prefs_path, "w") as f:
-                        _json.dump(prefs, f, indent=2)
-                except Exception:
-                    pass
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: Planner preference update: %s", exc)
 
         # --- 4. Memory consolidation ---
         try:
             if self._memory is not None and hasattr(self._memory, "store_episodic"):
                 self._memory.store_episodic(
                     description=f"Tool execution: {tool_name}",
-                    summary=output[:200] if success else error,
+                    summary=output[:500] if success else error,
                     outcome="success" if success else "failure",
                     tags=[tool_name, "tool_execution"],
                 )
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: --- 4. Memory consolidation ---: %s", exc)
 
     # ------------------------------------------------------------------
     # EventBus publishing
@@ -1000,8 +1013,8 @@ class RuntimeHotPath:
         try:
             if self._event_bus is not None and hasattr(self._event_bus, "publish"):
                 self._event_bus.publish(event_type, data)
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: _publish_event: --------------------------------------------: %s", exc)
 
     # ------------------------------------------------------------------
     # Task ID generation
@@ -1057,8 +1070,8 @@ class RuntimeHotPath:
                 output["planner_tool_preferences"] = {
                     k: round(v, 3) for k, v in self._planner._tool_preferences.items()
                 }
-        except Exception:
-            pass
+        except Exception as exc:
+            logger.debug("runtime: Include planner preferences if available: %s", exc)
 
         return output
 

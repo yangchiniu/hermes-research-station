@@ -144,7 +144,24 @@ def on_session_start(session_id: str = "", **_: Any) -> None:
 
 def _on_tool_completed_event(event_data: dict) -> None:
     """Called when a tool.completed event fires on EventBus."""
-    pass  # Reserved for future proactive behaviours
+    _ensure_runtime()
+    if _runtime is None:
+        return
+
+    tool = event_data.get("tool", "unknown")
+    task_id = event_data.get("task_id", "")
+    duration = event_data.get("duration_s", 0)
+
+    # Log to event logger for audit trail
+    if _event_logger is not None:
+        try:
+            _event_logger.log(
+                "eventbus.tool_completed",
+                {"tool": tool, "task_id": task_id, "duration_s": duration},
+                severity="info",
+            )
+        except Exception:
+            pass
 
 
 def _on_tool_failed_event(event_data: dict) -> None:
@@ -153,33 +170,82 @@ def _on_tool_failed_event(event_data: dict) -> None:
     if _runtime is None:
         return
 
-    # If stability is low after a failure, trigger observation
+    tool = event_data.get("tool", "unknown")
+    task_id = event_data.get("task_id", "")
+    violations = event_data.get("violations", [])
+
     try:
         status = _runtime.get_status()
-        if status.get("behavior_mode") in ("safe", "frozen"):
-            # In safe/frozen mode, log a warning
-            logger.warning(
-                "hermes-core: tool failure in %s mode",
-                status["behavior_mode"],
+        mode = status.get("behavior_mode", "unknown")
+        stability = status.get("stability_score", 1.0)
+
+        # Log warning for any failure
+        logger.warning(
+            "hermes-core: tool.failed event — tool=%s mode=%s stability=%.2f violations=%d",
+            tool, mode, stability, len(violations),
+        )
+
+        # Log to event logger
+        if _event_logger is not None:
+            _event_logger.log(
+                "eventbus.tool_failed",
+                {
+                    "tool": tool,
+                    "task_id": task_id,
+                    "mode": mode,
+                    "stability": stability,
+                    "violations": violations[:5],
+                },
+                severity="warning",
             )
-            if _event_logger is not None:
-                _event_logger.log(
-                    "runtime.behavior_warning",
-                    {
-                        "mode": status["behavior_mode"],
-                        "stability": status.get("stability_score", 0),
-                        "event": event_data,
-                    },
-                    severity="warning",
-                )
+
+        # In safe/frozen mode, trigger self-observation for diagnosis
+        if mode in ("safe", "frozen"):
+            if _runtime._self_obs is not None and hasattr(_runtime._self_obs, "run_once"):
+                try:
+                    report = _runtime._self_obs.run_once()
+                    if report:
+                        logger.info(
+                            "hermes-core: triggered self-observation after failure in %s mode", mode,
+                        )
+                except Exception:
+                    pass
     except Exception:
         pass
 
 
 def _on_recovery_event(event_data: dict) -> None:
     """Called when recovery.triggered event fires."""
+    _ensure_runtime()
     logger.info("hermes-core: recovery triggered via EventBus")
-    # Future: trigger self-observation loop
+
+    if _runtime is None:
+        return
+
+    # Trigger self-observation for post-recovery diagnosis
+    try:
+        if _runtime._self_obs is not None and hasattr(_runtime._self_obs, "run_once"):
+            report = _runtime._self_obs.run_once()
+            if report:
+                logger.info("hermes-core: post-recovery self-observation completed")
+                if hasattr(report, "alerts") and report.alerts:
+                    logger.warning(
+                        "hermes-core: post-recovery alerts: %s",
+                        "; ".join(report.alerts[:3]),
+                    )
+    except Exception:
+        pass
+
+    # Log recovery event
+    if _event_logger is not None:
+        try:
+            _event_logger.log(
+                "eventbus.recovery",
+                {"event": event_data},
+                severity="info",
+            )
+        except Exception:
+            pass
 
 
 # ---------------------------------------------------------------------------
@@ -262,6 +328,16 @@ def pre_tool_call(
                 _telemetry.record_tool_attempt(tool_name=tool_name)
             elif hasattr(_telemetry, "collect"):
                 _telemetry.collect()
+    except Exception:
+        pass
+
+    # ---- 4. Watchdog deadlock check (periodic ~10%) ----
+    try:
+        if hash(tool_call_id or tool_name) % 10 == 0:
+            if _runtime._watchdog is not None and hasattr(_runtime._watchdog, "check_deadlocks"):
+                deadlocks = _runtime._watchdog.check_deadlocks()
+                if deadlocks:
+                    logger.warning("hermes-core: watchdog detected %d deadlocks", len(deadlocks))
     except Exception:
         pass
 
@@ -375,7 +451,17 @@ def post_tool_call(
         except Exception:
             pass
 
-        # 2b. Learning loop: Reflection → Experience → Memory
+        # 2b. Retrieve memory context for learning loop
+        memory_ctx = {}
+        try:
+            if hasattr(_runtime, "_retrieve_memory_context"):
+                memory_ctx = _runtime._retrieve_memory_context(
+                    tool_name, args or {}, {"goal": tool_name, "domain": "general"},
+                )
+        except Exception:
+            pass
+
+        # 2c. Learning loop: Reflection → Experience → Memory
         try:
             # Use RuntimeHotPath's learning loop
             if hasattr(_runtime, "_run_learning_loop"):
@@ -383,26 +469,81 @@ def post_tool_call(
                     tool_name=tool_name,
                     task_id=task_id or tool_call_id or f"auto_{int(time.time())}",
                     success=success,
-                    output=output[:300],
+                    output=output[:1000],
                     error=error,
                     duration=_duration,
                     ctx={"goal": tool_name, "domain": "general"},
+                    memory_context=memory_ctx,
                 )
         except Exception:
             pass
 
-        # 2c. Drift analysis (periodic, not every call — sample rate ~10%)
+        # 2d. Drift analysis (periodic, not every call — sample rate ~10%)
         try:
             if hash(tool_call_id or tool_name) % 10 == 0:  # 10% sampling
                 if hasattr(_runtime, "_drift") and _runtime._drift is not None:
-                    if hasattr(_runtime._drift, "observe"):
-                        drift = _runtime._drift.observe({
-                            "tool": tool_name,
-                            "success": success,
-                            "task_id": task_id or "",
-                        })
-                        if drift and drift.get("action_required"):
+                    # DriftAnalyzer has analyze_all(), not observe()
+                    if hasattr(_runtime._drift, "get_summary"):
+                        drift = _runtime._drift.get_summary()
+                    elif hasattr(_runtime._drift, "analyze_all"):
+                        drift = _runtime._drift.analyze_all()
+                    else:
+                        drift = {}
+                    if drift and drift.get("action_required"):
+                        if hasattr(_runtime, "_apply_active_defense"):
                             _runtime._apply_active_defense(drift)
+        except Exception:
+            pass
+
+        # 2e. TaskGraph — record tool call as task node (lazy graph creation)
+        try:
+            if _runtime._task_graph is not None and hasattr(_runtime._task_graph, "add_node"):
+                import uuid as _uuid
+                from datetime import datetime, timezone
+                _now = datetime.now(timezone.utc).isoformat()
+                _node_id = f"tc_{tool_call_id or _uuid.uuid4().hex[:8]}"
+                # Lazy-init a session graph
+                _graph_id = f"session_{session_id or 'default'}"
+                if not hasattr(_runtime, "_session_graph_id"):
+                    _runtime._session_graph_id = None
+                if _runtime._session_graph_id is None:
+                    try:
+                        from .task_graph import TaskNode, TaskGraphEngine
+                        _runtime._session_graph_id = _runtime._task_graph.create_graph(
+                            name=_graph_id, nodes=[],
+                        )
+                    except Exception:
+                        _runtime._session_graph_id = _graph_id
+                # Record as completed node
+                try:
+                    from .task_graph import TaskNode
+                    _node = TaskNode(
+                        node_id=_node_id,
+                        action=tool_name,
+                        params={"args_keys": list((args or {}).keys())},
+                        depends_on=[],
+                        status="completed" if success else "failed",
+                        result={"output_len": len(output)} if success else None,
+                        error=error[:200] if error else None,
+                        started_at=_now,
+                        completed_at=_now,
+                    )
+                    _runtime._task_graph.add_node(_runtime._session_graph_id, _node)
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+        # 2f. SelfObservation — periodic deep analysis (~5% sampling)
+        try:
+            if hash(tool_call_id or tool_name) % 20 == 0:  # 5% sampling
+                if _runtime._self_obs is not None and hasattr(_runtime._self_obs, "run_once"):
+                    report = _runtime._self_obs.run_once()
+                    if report and hasattr(report, "alerts") and report.alerts:
+                        logger.warning(
+                            "hermes-core: self-obs alerts: %s",
+                            "; ".join(report.alerts[:3]),
+                        )
         except Exception:
             pass
 
