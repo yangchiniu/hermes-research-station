@@ -1,0 +1,13 @@
+name: hermes-core
+version: 1.0.0
+description: "Hermes vNext core integration — Event Sourcing, Telemetry, OODA, Planner, Field Runner"
+author: "user"
+hooks:
+  - on_session_start
+  - pre_tool_call
+  - post_tool_call
+  - post_llm_call
+  - on_session_end
+commands:
+  - /field-test
+  - /health
