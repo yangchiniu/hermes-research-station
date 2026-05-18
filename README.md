@@ -86,6 +86,8 @@
 ```
 hermes-research-station/
 ├── README.md              ← 你在这里
+├── data/
+│   └── cas_oa_journals.json  ← 中科院OA期刊目录 (123本)
 ├── docs/
 │   ├── vision.md          ← 详细愿景与规划
 │   ├── architecture.md    ← 技术架构详解
