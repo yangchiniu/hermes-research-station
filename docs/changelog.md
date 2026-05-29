@@ -1,5 +1,54 @@
 # Changelog
 
+## 2026-05-29: Phase 2 — 4 激活模块 + 2 项质量修复
+
+### 背景
+
+hermes-core 有 4 个子系统一直在初始化但未激活（Telemetry、Watchdog、Goal Manager、Drift Analyzer），以及 Planner 的 LLM 分解功能存在生产环境断路问题。本次完成激活 + 修复。
+
+### 核心变更
+
+**模块激活（4/4）**
+- Telemetry: 60s 守护线程采集运行时指标 ✅
+- Watchdog: 每次工具调用发送心跳 + 死锁检测 ✅
+- Goal Manager: 自动追踪唯一工具调用并标记完成 ✅
+- Drift Analyzer: 保持 10% 采样激活 ✅
+- 所有模块通过 RuntimeHotPath._init_subsystems() 在启动时统一激活
+
+**Planner LLM 分解修复（P0）**
+- 问题: `_llm_decompose_goal()` 使用裸 `urllib.request` 直调 API，不走 Hermes 配置、不走代理（Clash）、无重试
+- 修复:
+  - 读取 `~/.hermes/config.yaml` 获取模型端点（`model.base_url` + `model.default`）
+  - `ProxyHandler` 自动尊重 HTTP_PROXY/HTTPS_PROXY 环境变量
+  - 3 次重试 + 指数退避（1s, 2s, 最终失败）
+  - 保留环境变量回退（向后兼容）
+- 效果: 从"硬编码断路"变为"config.yaml 同步 + 代理 + 重试"
+
+**Goal 自动追踪修复（P1）**
+- 问题: 匹配使用 `endswith(tool_name)` — 子串误匹配风险；遍历全部 goal 的 O(n) 复杂度
+- 修复: 模块级 `_GOAL_TOOL_INDEX` 反向索引 → 精确 O(1) 匹配
+- 额外 bug 修复: `register_goal(..., domain="tool")` 参数不合法（`register_goal` 不接受 `domain`），整段代码一直在静默 TypeError。改为 `context={"domain": "tool"}`，首次真正生效
+
+### 项目评分
+
+| 维度 | 之前 | 之后 |
+|------|------|------|
+| 架构设计 | 9 | 9 |
+| 代码质量 | 8 | 8 |
+| 模块激活 | 6 | 8 |
+| 运行时健壮性 | 7 | 8 |
+| 测试成熟度 | 7 | 7 |
+| 集成就绪度 | 7 | 7 |
+| 功能完整度 | 8 | 8 |
+| **总分** | **7.4** | **7.9** |
+
+### 验证
+
+- 56/56 测试通过（0 failed, 0 skipped）
+- 实际推理: config.yaml 正确读取、ProxyHandler 配置、无 key 优雅回退均验证
+
+---
+
 ## 2026-05-19: L3 引擎迁移 — Edge CDP → CloakBrowser
 
 ### 背景

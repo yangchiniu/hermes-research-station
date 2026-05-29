@@ -16,6 +16,7 @@ import json
 import logging
 import random
 import sys
+import threading
 import time
 from typing import Any, Optional
 
@@ -26,11 +27,61 @@ logger = logging.getLogger(__name__)
 # ---------------------------------------------------------------------------
 
 _runtime = None
-_event_logger = None
-_telemetry = None
-_telemetry_started = False
 _session_start_time: float = 0.0
 _call_timers: dict = {}  # tool_call_id → start_time for duration tracking
+
+# Goal auto-tracking index — tool_name → goal_id (exact match, O(1))
+_GOAL_TOOL_INDEX: dict[str, str] = {}
+
+# Latency profiling — stage timings for post_tool_call pipeline
+_profile_lock = threading.Lock()
+_profile_counts: dict[str, int] = {}       # stage_name → call count
+_profile_total: dict[str, float] = {}      # stage_name → total seconds
+_profile_log_interval = 20                 # log summary every N calls
+_profile_call_count = 0
+
+
+def _profile_stage(stage_name: str, elapsed_s: float) -> None:
+    """Record timing for a pipeline stage (thread-safe)."""
+    with _profile_lock:
+        _profile_counts[stage_name] = _profile_counts.get(stage_name, 0) + 1
+        _profile_total[stage_name] = _profile_total.get(stage_name, 0.0) + elapsed_s
+
+
+def _log_profile_summary() -> None:
+    """Log aggregate latency profile and reset counters."""
+    global _profile_call_count
+    with _profile_lock:
+        if not _profile_counts:
+            return
+        parts = []
+        for name in sorted(_profile_counts):
+            n = _profile_counts[name]
+            t = _profile_total[name]
+            avg_ms = (t / n) * 1000.0
+            pct = (t / _profile_total.get("_total_hook", 1.0)) * 100.0 if "_total_hook" in _profile_total else 0.0
+            parts.append(f"{name}={avg_ms:.1f}ms({pct:.0f}%)")
+        logger.info(
+            "hermes-core: latency profile [%d calls]: %s",
+            _profile_call_count,
+            " | ".join(parts),
+        )
+        # Also write to events table if available
+        try:
+            _eb_mod = sys.modules.get("event_bus")
+            if _eb_mod and hasattr(_eb_mod, "get_bus"):
+                bus = _eb_mod.get_bus()
+                if bus and hasattr(bus, "publish"):
+                    bus.publish("profile.latency", {
+                        "call_count": _profile_call_count,
+                        "stages": {k: {"avg_ms": round((_profile_total[k] / v) * 1000, 1)}
+                                   for k, v in _profile_counts.items()},
+                    })
+        except Exception:
+            pass
+        _profile_counts.clear()
+        _profile_total.clear()
+        _profile_call_count = 0
 
 
 def _ensure_runtime() -> None:
@@ -43,26 +94,6 @@ def _ensure_runtime() -> None:
             logger.info("hermes-core: RuntimeHotPath initialised")
         except Exception as exc:
             logger.warning("hermes-core: RuntimeHotPath init failed: %s", exc)
-
-
-def _ensure_legacy() -> None:
-    """Legacy init for event_logger (backward compat)."""
-    global _event_logger, _telemetry, _telemetry_started
-
-    if _event_logger is None:
-        try:
-            from . import _core_on_path, _core_off_path
-
-            _core_on_path()
-            import event_logger as _el
-            import telemetry as _tm
-
-            _core_off_path()
-            _event_logger = _el.get_logger()
-            _telemetry = _tm.Telemetry()
-            logger.debug("hermes-core: legacy init ok")
-        except Exception as exc:
-            logger.warning("hermes-core: legacy init failed: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -84,46 +115,26 @@ def _safe_truncate(text: str, max_len: int = 500) -> str:
 def on_session_start(session_id: str = "", **_: Any) -> None:
     """Hook invoked at the start of every Hermes session.
 
-    Initialises the RuntimeHotPath, EventBus connectivity, legacy event
-    logger, telemetry collection, and registers EventBus listeners.
+    Initialises the RuntimeHotPath, EventBus connectivity,
+    and registers EventBus listeners.
     """
-    global _session_start_time, _telemetry_started
+    global _session_start_time
     _session_start_time = time.time()
 
-    # Init both new runtime and legacy systems
+    # Initialise RuntimeHotPath
     _ensure_runtime()
-    _ensure_legacy()
 
-    # Log session start
-    if _event_logger is not None:
-        try:
-            _event_logger.log(
-                "session.start",
-                {"session_id": session_id},
-                severity="info",
-            )
-        except Exception as exc:
-            logger.debug("hermes-core: session.start event logging: %s", exc)
+    # Log session start — done via RuntimeHotPath
+    logger.info("hermes-core: session %s started", session_id)
 
-    # Start telemetry background collection
-    if _telemetry is not None and not _telemetry_started:
-        try:
-            _telemetry.start(interval_s=60.0)
-            _telemetry_started = True
-            logger.debug("hermes-core: telemetry started")
-        except Exception as exc:
-            logger.debug("hermes-core: telemetry start: %s", exc)
-
-    # --- NEW: Register EventBus listeners for cross-module signalling ---
+    # Register EventBus listeners for cross-module signalling
     try:
         if _runtime:
-            from . import _core_on_path, _core_off_path
+            from .__init__ import _lazy_core as _lc
 
-            _core_on_path()
             try:
-                import event_bus
-
-                bus = event_bus.get_bus()
+                _bus_mod = _lc("event_bus")
+                bus = _bus_mod.get_bus() if _bus_mod else None
                 if bus and hasattr(bus, "subscribe"):
                     bus.subscribe("tool.completed", _on_tool_completed_event)
                     bus.subscribe("tool.failed", _on_tool_failed_event)
@@ -131,8 +142,6 @@ def on_session_start(session_id: str = "", **_: Any) -> None:
                     logger.info("hermes-core: registered EventBus listeners")
             except Exception as exc:
                 logger.debug("hermes-core: EventBus listener registration: %s", exc)
-            finally:
-                _core_off_path()
     except Exception as exc:
         logger.debug("hermes-core: EventBus setup outer: %s", exc)
 
@@ -144,37 +153,29 @@ def on_session_start(session_id: str = "", **_: Any) -> None:
 # ---------------------------------------------------------------------------
 
 
-def _on_tool_completed_event(event_data: dict) -> None:
+def _on_tool_completed_event(event_data) -> None:
     """Called when a tool.completed event fires on EventBus."""
     _ensure_runtime()
     if _runtime is None:
         return
 
-    tool = event_data.get("tool", "unknown")
-    task_id = event_data.get("task_id", "")
-    duration = event_data.get("duration_s", 0)
+    # event_data is an Event dataclass; payload lives in .data
+    tool = event_data.data.get("tool", "unknown")
+    task_id = event_data.data.get("task_id", "")
+    duration = event_data.data.get("duration_s", 0)
 
-    # Log to event logger for audit trail
-    if _event_logger is not None:
-        try:
-            _event_logger.log(
-                "eventbus.tool_completed",
-                {"tool": tool, "task_id": task_id, "duration_s": duration},
-                severity="info",
-            )
-        except Exception as exc:
-            logger.debug("hermes-core: eventlogger tool.completed: %s", exc)
+    # RuntimeHotPath handles the audit trail internally
 
 
-def _on_tool_failed_event(event_data: dict) -> None:
+def _on_tool_failed_event(event_data) -> None:
     """Called when a tool.failed event fires."""
     _ensure_runtime()
     if _runtime is None:
         return
 
-    tool = event_data.get("tool", "unknown")
-    task_id = event_data.get("task_id", "")
-    violations = event_data.get("violations", [])
+    tool = event_data.data.get("tool", "unknown")
+    task_id = event_data.data.get("task_id", "")
+    violations = event_data.data.get("violations", [])
 
     try:
         status = _runtime.get_status()
@@ -186,20 +187,6 @@ def _on_tool_failed_event(event_data: dict) -> None:
             "hermes-core: tool.failed event — tool=%s mode=%s stability=%.2f violations=%d",
             tool, mode, stability, len(violations),
         )
-
-        # Log to event logger
-        if _event_logger is not None:
-            _event_logger.log(
-                "eventbus.tool_failed",
-                {
-                    "tool": tool,
-                    "task_id": task_id,
-                    "mode": mode,
-                    "stability": stability,
-                    "violations": violations[:5],
-                },
-                severity="warning",
-            )
 
         # In safe/frozen mode, trigger self-observation for diagnosis
         if mode in ("safe", "frozen"):
@@ -216,7 +203,7 @@ def _on_tool_failed_event(event_data: dict) -> None:
         logger.debug("hermes-core: tool.failed handler: %s", exc)
 
 
-def _on_recovery_event(event_data: dict) -> None:
+def _on_recovery_event(event_data) -> None:
     """Called when recovery.triggered event fires."""
     _ensure_runtime()
     logger.info("hermes-core: recovery triggered via EventBus")
@@ -238,18 +225,8 @@ def _on_recovery_event(event_data: dict) -> None:
     except Exception as exc:
         logger.debug("hermes-core: post-recovery self_observation: %s", exc)
 
-    # Log recovery event
-    if _event_logger is not None:
-        try:
-            _event_logger.log(
-                "eventbus.recovery",
-                {"event": event_data},
-                severity="info",
-            )
-        except Exception as exc:
-            logger.debug("hermes-core: eventlogger recovery event: %s", exc)
-
-
+    # Log recovery event — RuntimeHotPath handles audit trail internally
+    
 # ---------------------------------------------------------------------------
 # Hook: pre_tool_call — Standard Tool HotPath Integration
 # ---------------------------------------------------------------------------
@@ -302,6 +279,9 @@ def pre_tool_call(
     # Record start time for duration tracking
     _call_timers[tool_call_id or tool_name] = time.time()
 
+    # Total hook timer
+    _t0 = time.time()
+
     # ---- 1. PolicyEngine check ----
     try:
         if _runtime._policy is not None:
@@ -323,17 +303,7 @@ def pre_tool_call(
     except Exception as exc:
         logger.debug("hermes-core: WorldModel snapshot: %s", exc)
 
-    # ---- 3. Telemetry record_attempt ----
-    try:
-        if _telemetry is not None:
-            if hasattr(_telemetry, "record_tool_attempt"):
-                _telemetry.record_tool_attempt(tool_name=tool_name)
-            elif hasattr(_telemetry, "collect"):
-                _telemetry.collect()
-    except Exception as exc:
-        logger.debug("hermes-core: Telemetry record_attempt: %s", exc)
-
-    # ---- 4. Watchdog deadlock check (periodic ~10%) ----
+    # ---- 3. Watchdog deadlock check (periodic ~10%) ----
     try:
         if random.random() < 0.1:
             if _runtime._watchdog is not None and hasattr(_runtime._watchdog, "check_deadlocks"):
@@ -342,6 +312,8 @@ def pre_tool_call(
                     logger.warning("hermes-core: watchdog detected %d deadlocks", len(deadlocks))
     except Exception as exc:
         logger.debug("hermes-core: Watchdog deadlock check: %s", exc)
+
+    _profile_stage("pre_tool", time.time() - _t0)
 
     return None  # Allow execution
 
@@ -362,57 +334,28 @@ def post_tool_call(
 ) -> None:
     """Called after every Hermes tool invocation.
 
-    This is the Runtime Hot Path entry point. Every tool call flows through:
-        1. Legacy: log to event_logger (backward compat)
-        2. RuntimeHotPath: Telemetry record
-        3. RuntimeHotPath: Learning loop (Reflection → Experience → Memory)
-        4. RuntimeHotPath: DriftAnalyzer observe
-        5. RuntimeHotPath: Stability → Behavior Control adjustment
+    Standard tools (terminal, read_file, etc.) flow through:
+        1. RuntimeHotPath: Telemetry record
+        2. RuntimeHotPath: Learning loop (Reflection → Experience → Memory)
+        3. RuntimeHotPath: DriftAnalyzer (async, 10% sampling)
+
+    core_* tools skip this hook — their pipeline already ran in execute_tool().
     """
     if not tool_name:
         return
 
-    # ---- 1. Legacy logging ----
-    _ensure_legacy()
+    # core_* tools already ran the full pipeline inside execute_tool()
+    if tool_name.startswith("core_"):
+        return
 
-    if _event_logger is not None:
-        try:
-            safe_args = {}
-            if isinstance(args, dict):
-                for k, v in args.items():
-                    if isinstance(v, str) and len(v) > 500:
-                        safe_args[k] = v[:100] + "..."
-                    else:
-                        safe_args[k] = v
-
-            status = "ok"
-            if result is None:
-                status = "empty"
-            elif isinstance(result, str) and len(result) >= 200_000:
-                status = "truncated"
-
-            _event_logger.log(
-                "tool.call",
-                {
-                    "tool": tool_name,
-                    "args": safe_args,
-                    "status": status,
-                    "task_id": task_id,
-                    "session_id": session_id,
-                    "tool_call_id": tool_call_id,
-                },
-                severity="info",
-            )
-        except Exception as exc:
-            logger.debug("hermes-core: eventlogger tool.call: %s", exc)
-
-    # ---- 2. RuntimeHotPath post-execution pipeline ----
+    # ---- 1. RuntimeHotPath post-execution pipeline ----
     _ensure_runtime()
     if _runtime is None:
         return
 
     try:
         # Detect success/failure from result
+        _t0_hook = time.time()
         success = True
         error = ""
         output = ""
@@ -443,17 +386,10 @@ def post_tool_call(
         _start = _call_timers.pop(tool_call_id or tool_name, None)
         _duration = (time.time() - _start) if _start else 0.0
 
-        # 2a. Telemetry record
-        try:
-            if _telemetry is not None:
-                if hasattr(_telemetry, "record_tool"):
-                    _telemetry.record_tool(tool_name=tool_name, success=success)
-                elif hasattr(_telemetry, "collect"):
-                    _telemetry.collect()
-        except Exception as exc:
-            logger.debug("hermes-core: Telemetry record_tool: %s", exc)
+        # ── Stage timing: memory context retrieval ──
+        _t0 = time.time()
 
-        # 2b. Retrieve memory context for learning loop
+        # 2a. Retrieve memory context for learning loop
         memory_ctx = {}
         try:
             if hasattr(_runtime, "_retrieve_memory_context"):
@@ -463,11 +399,33 @@ def post_tool_call(
         except Exception as exc:
             logger.debug("hermes-core: memory context retrieval: %s", exc)
 
-        # 2c. Learning loop: Reflection → Experience → Memory
+        _profile_stage("memory_ctx", time.time() - _t0)
+
+        # ── Stage timing: learning loop ──
+        _t0 = time.time()
+
+        # 2b. Learning loop: Reflection → Experience → Memory (with PolicyEngine gate)
         try:
-            # Use RuntimeHotPath's learning loop
             if hasattr(_runtime, "_run_learning_loop"):
-                _runtime._run_learning_loop(
+                _policy_allowed = True
+                if _runtime._policy is not None:
+                    try:
+                        _policy_result = _runtime._policy.check_action(
+                            tool_name, args or {}
+                        )
+                        _policy_allowed = _policy_result.get("allowed", True)
+                    except Exception as exc:
+                        logger.debug(
+                            "hermes-core: policy check before learning: %s", exc
+                        )
+
+                if not _policy_allowed:
+                    logger.debug(
+                        "hermes-core: learning skipped — policy denied for %s",
+                        tool_name,
+                    )
+                else:
+                    _runtime._run_learning_loop(
                     tool_name=tool_name,
                     task_id=task_id or tool_call_id or f"auto_{int(time.time())}",
                     success=success,
@@ -480,49 +438,20 @@ def post_tool_call(
         except Exception as exc:
             logger.debug("hermes-core: learning loop: %s", exc)
 
-        # 2d. Drift analysis (periodic, not every call — sample rate ~10%)
-        try:
-            if random.random() < 0.1:  # 10% sampling
-                if hasattr(_runtime, "_drift") and _runtime._drift is not None:
-                    # DriftAnalyzer has analyze_all(), not observe()
-                    if hasattr(_runtime._drift, "get_summary"):
-                        drift = _runtime._drift.get_summary()
-                    elif hasattr(_runtime._drift, "analyze_all"):
-                        drift = _runtime._drift.analyze_all()
-                    else:
-                        drift = {}
-                    if drift and drift.get("action_required"):
-                        if hasattr(_runtime, "_apply_active_defense"):
-                            _runtime._apply_active_defense(drift)
-        except Exception as exc:
-            logger.debug("hermes-core: drift analysis: %s", exc)
+        _profile_stage("learning_loop", time.time() - _t0)
 
-        # 2e. TaskGraph — record tool call as task node (lazy graph creation)
+        # ── Stage timing: TaskGraph ──
+        _t0 = time.time()
+
+        # 2c. TaskGraph — record tool call as task node (lazy graph creation)
         try:
             if _runtime._task_graph is not None and hasattr(_runtime._task_graph, "add_node"):
                 import uuid as _uuid
                 from datetime import datetime, timezone
                 _now = datetime.now(timezone.utc).isoformat()
                 _node_id = f"tc_{tool_call_id or _uuid.uuid4().hex[:8]}"
-                # Lazy-init a session graph
-                _graph_id = f"session_{session_id or 'default'}"
-                if not hasattr(_runtime, "_session_graph_id"):
-                    _runtime._session_graph_id = None
-                if _runtime._session_graph_id is None:
-                    try:
-                        _tg_mod = sys.modules.get("task_graph")
-                        if _tg_mod is None:
-                            raise ImportError("task_graph not loaded")
-                        _runtime._session_graph_id = _runtime._task_graph.create_graph(
-                            name=_graph_id, nodes=[],
-                        )
-                    except Exception:
-                        _runtime._session_graph_id = _graph_id
-                # Record as completed node
-                try:
-                    _tg_mod = sys.modules.get("task_graph")
-                    if _tg_mod is None:
-                        raise ImportError("task_graph not loaded")
+                _tg_mod = sys.modules.get("task_graph")
+                if _tg_mod is not None:
                     TaskNode = _tg_mod.TaskNode
                     _node = TaskNode(
                         node_id=_node_id,
@@ -535,26 +464,30 @@ def post_tool_call(
                         started_at=_now,
                         completed_at=_now,
                     )
-                    _runtime._task_graph.add_node(_runtime._session_graph_id, _node)
-                except Exception as exc:
-                    logger.debug("hermes-core: TaskGraph add_node: %s", exc)
+                    if not hasattr(_runtime, "_session_graph_id"):
+                        _runtime._session_graph_id = None
+                    if _runtime._session_graph_id is None:
+                        _graph_id = f"session_{session_id or 'default'}"
+                        try:
+                            _runtime._session_graph_id = _runtime._task_graph.create_graph(
+                                name=_graph_id, nodes=[_node],
+                            )
+                        except Exception as exc:
+                            logger.debug("hermes-core: TaskGraph create_graph: %s", exc)
+                    else:
+                        try:
+                            _runtime._task_graph.add_node(_runtime._session_graph_id, _node)
+                        except Exception as exc:
+                            logger.debug("hermes-core: TaskGraph add_node: %s", exc)
         except Exception as exc:
             logger.debug("hermes-core: TaskGraph record: %s", exc)
 
-        # 2f. SelfObservation — periodic deep analysis (~5% sampling)
-        try:
-            if random.random() < 0.05:  # 5% sampling
-                if _runtime._self_obs is not None and hasattr(_runtime._self_obs, "run_once"):
-                    report = _runtime._self_obs.run_once()
-                    if report and hasattr(report, "alerts") and report.alerts:
-                        logger.warning(
-                            "hermes-core: self-obs alerts: %s",
-                            "; ".join(report.alerts[:3]),
-                        )
-        except Exception as exc:
-            logger.debug("hermes-core: SelfObservation run_once: %s", exc)
+        _profile_stage("task_graph", time.time() - _t0)
 
-        # 2g. EventBus publish — tool.completed / tool.failed
+        # ── Stage timing: EventBus ──
+        _t0 = time.time()
+
+        # 2d. EventBus publish — tool.completed / tool.failed
         try:
             _pub_bus = None
             _eb_mod = sys.modules.get("event_bus")
@@ -574,8 +507,148 @@ def post_tool_call(
         except Exception as exc:
             logger.debug("hermes-core: EventBus publish: %s", exc)
 
+        _profile_stage("event_bus", time.time() - _t0)
+
+        # 2e. Drift analysis — async (10% sampling, daemon thread)
+        if random.random() < 0.1:
+            threading.Thread(
+                target=_async_drift_analysis,
+                args=(_runtime,),
+                daemon=True,
+            ).start()
+
+        # 2f. Self-observation — async (5% sampling, daemon thread)
+        if random.random() < 0.05:
+            threading.Thread(
+                target=_async_self_observation,
+                args=(_runtime,),
+                daemon=True,
+            ).start()
+
+        # 2g. Watchdog heartbeat — every tool call
+        try:
+            _wd_mod = sys.modules.get("watchdog")
+            if _wd_mod is not None and hasattr(_wd_mod, "get_watchdog"):
+                _wd = _wd_mod.get_watchdog()
+                if _wd is not None and hasattr(_wd, "heartbeat"):
+                    _wd.heartbeat(tool_name)
+        except Exception as exc:
+            logger.debug("hermes-core: watchdog heartbeat: %s", exc)
+
+        # 2h. Goal auto-tracking — register new goal per unique tool call
+        try:
+            _gm_mod = sys.modules.get("goal_manager")
+            if _gm_mod is not None and hasattr(_gm_mod, "get_goal_manager"):
+                _gm = _gm_mod.get_goal_manager()
+                if _gm is not None and hasattr(_gm, "register_goal"):
+                    # Register a goal for each unique tool call (exact match)
+                    if tool_name not in _GOAL_TOOL_INDEX:
+                        goal_id = _gm.register_goal(
+                            f"Execute tool: {tool_name}",
+                            priority=3,
+                            context={"domain": "tool"},
+                        )
+                        if goal_id:
+                            _GOAL_TOOL_INDEX[tool_name] = goal_id
+
+                    # Complete on success — O(1) lookup via reverse index
+                    if success and hasattr(_gm, "complete_goal"):
+                        gid = _GOAL_TOOL_INDEX.get(tool_name)
+                        if gid is not None:
+                            _gm.complete_goal(gid)
+        except Exception as exc:
+            logger.debug("hermes-core: goal tracking: %s", exc)
+
     except Exception as exc:
         logger.debug("hermes-core: post_tool_call runtime pipeline error: %s", exc)
+
+    # Record total hook time (includes: output parsing + memory_ctx + learning_loop + task_graph + event_bus)
+    _profile_stage("_total_hook", time.time() - _t0_hook)
+
+    # ── Periodic latency profile summary ──
+    global _profile_call_count
+    _profile_call_count += 1
+    if _profile_call_count >= _profile_log_interval:
+        _log_profile_summary()
+
+
+# ---------------------------------------------------------------------------
+# Async helpers — run in daemon thread to avoid blocking the tool pipeline
+# ---------------------------------------------------------------------------
+
+
+def _async_drift_analysis(runtime) -> None:
+    """Run drift analysis in a background thread.
+
+    If drift is detected, applies active defense AND feeds back to
+    PolicyEngine so future ``check_action()`` calls reflect the
+    adjusted thresholds.
+    """
+    try:
+        if hasattr(runtime, "_drift") and runtime._drift is not None:
+            if hasattr(runtime._drift, "get_summary"):
+                drift = runtime._drift.get_summary()
+            elif hasattr(runtime._drift, "analyze_all"):
+                drift = runtime._drift.analyze_all()
+            else:
+                drift = {}
+            if drift and drift.get("action_required"):
+                # 1. Active defense (memory pruning, planner reset, etc.)
+                if hasattr(runtime, "_apply_active_defense"):
+                    runtime._apply_active_defense(drift)
+
+                # 2. PolicyEngine feedback
+                _apply_drift_to_policy(runtime, drift)
+    except Exception as exc:
+        logger.debug("hermes-core: async drift analysis: %s", exc)
+
+
+def _apply_drift_to_policy(runtime, drift: dict) -> None:
+    """Translate drift suggestions into PolicyEngine ``update_policy`` calls."""
+    if not hasattr(runtime, "_policy") or runtime._policy is None:
+        return
+    if not hasattr(runtime._policy, "update_policy"):
+        return
+    suggested = drift.get("suggested_actions", [])
+    if not suggested:
+        return
+    for suggestion in suggested:
+        try:
+            action_part = suggestion.split(":", 1)[0].strip()
+            if action_part == "raise_threshold":
+                runtime._policy.update_policy("raise_threshold",
+                                              adjust={"new_risk": "high"})
+                logger.info("hermes-core: drift → policy: raised risk threshold to 'high'")
+            elif action_part == "lower_threshold":
+                runtime._policy.update_policy("lower_threshold",
+                                              adjust={"new_risk": "medium"})
+                logger.info("hermes-core: drift → policy: lowered risk threshold to 'medium'")
+            elif action_part == "throttle_eventbus":
+                runtime._policy.update_policy("tune_limit",
+                                              adjust={"limit": "max_requests_per_domain",
+                                                      "value": 10})
+                logger.info("hermes-core: drift → policy: throttled max_requests_per_domain to 10")
+            elif action_part == "reduce_concurrency":
+                runtime._policy.update_policy("tune_limit",
+                                              adjust={"limit": "max_concurrent_tasks",
+                                                      "value": 1})
+                logger.info("hermes-core: drift → policy: reduced concurrency to 1")
+        except Exception as exc:
+            logger.debug("hermes-core: drift→policy translate: %s", exc)
+
+
+def _async_self_observation(runtime) -> None:
+    """Run self-observation in a background thread."""
+    try:
+        if runtime._self_obs is not None and hasattr(runtime._self_obs, "run_once"):
+            report = runtime._self_obs.run_once()
+            if report and hasattr(report, "alerts") and report.alerts:
+                logger.warning(
+                    "hermes-core: self-obs alerts: %s",
+                    "; ".join(report.alerts[:3]),
+                )
+    except Exception as exc:
+        logger.debug("hermes-core: async self-observation: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -594,38 +667,21 @@ def post_llm_call(
 ) -> None:
     """Called after every LLM API call.
 
-    Records token usage and latency for telemetry.
+    Records token usage for telemetry via RuntimeHotPath.
     """
     if not model:
         return
 
-    _ensure_legacy()
+    # Pass latency to RuntimeHotPath telemetry
+    _ensure_runtime()
+    if _runtime is None or _runtime._telemetry is None:
+        return
 
-    # Log to event_logger
-    if _event_logger is not None:
-        try:
-            _event_logger.log(
-                "llm.call",
-                {
-                    "model": model,
-                    "prompt_tokens": prompt_tokens,
-                    "completion_tokens": completion_tokens,
-                    "total_tokens": total_tokens,
-                    "duration_ms": duration_ms,
-                    "session_id": session_id,
-                },
-                severity="info",
-            )
-        except Exception as exc:
-            logger.debug("hermes-core: eventlogger llm.call: %s", exc)
-
-    # Pass latency to telemetry
-    if _telemetry is not None and duration_ms > 0:
-        try:
-            if hasattr(_telemetry, "record_llm_latency"):
-                _telemetry.record_llm_latency(duration_ms / 1000.0)
-        except Exception as exc:
-            logger.debug("hermes-core: Telemetry record_llm_latency: %s", exc)
+    try:
+        if hasattr(_runtime._telemetry, "record_llm_latency"):
+            _runtime._telemetry.record_llm_latency(duration_ms / 1000.0)
+    except Exception as exc:
+        logger.debug("hermes-core: Telemetry record_llm_latency: %s", exc)
 
 
 # ---------------------------------------------------------------------------
@@ -647,7 +703,6 @@ def on_session_end(
     global _session_start_time
 
     duration = time.time() - _session_start_time if _session_start_time else 0.0
-    _ensure_legacy()
     _ensure_runtime()
 
     # Build session telemetry summary
@@ -661,34 +716,16 @@ def on_session_end(
     stability_score = runtime_telemetry.get("current_stability", 0.0)
     behavior_mode = runtime_telemetry.get("behavior_mode", "unknown")
 
-    # Log session end
-    if _event_logger is not None:
-        try:
-            _event_logger.log(
-                "session.end",
-                {
-                    "session_id": session_id,
-                    "duration_s": round(duration, 1),
-                    "completed": completed,
-                    "interrupted": interrupted,
-                    "stability_score": round(stability_score, 3),
-                    "behavior_mode": behavior_mode,
-                    "total_tasks": runtime_telemetry.get("total_tasks_executed", 0),
-                    "subsystems_available": runtime_telemetry.get(
-                        "subsystems_available", 0
-                    ),
-                },
-                severity="info",
-            )
-        except Exception as exc:
-            logger.debug("hermes-core: eventlogger session.end: %s", exc)
-
-    # Collect final telemetry snapshot
-    if _telemetry is not None:
-        try:
-            _telemetry.collect()
-        except Exception as exc:
-            logger.debug("hermes-core: telemetry collect: %s", exc)
+    # Stop background threads to prevent leaks
+    if _runtime is not None:
+        for attr_name in ("_self_obs", "_watchdog", "_supervisor"):
+            try:
+                subsystem = getattr(_runtime, attr_name, None)
+                if subsystem is not None and hasattr(subsystem, "stop"):
+                    subsystem.stop()
+                    logger.debug("hermes-core: stopped %s", attr_name)
+            except Exception as exc:
+                logger.debug("hermes-core: stop %s: %s", attr_name, exc)
 
     logger.info(
         "hermes-core: session %s ended (%.1fs, stability=%.2f, mode=%s)",
