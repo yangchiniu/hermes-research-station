@@ -52,25 +52,31 @@ _core_lock = threading.Lock()
 
 
 def _lazy(name: str) -> Any:
+    """Import and cache a core module via importlib (unified lazy import).
+
+    ``_CORE_DIR`` is already on ``sys.path`` (set at module level above),
+    so bare ``importlib.import_module(name)`` works as a fallback.
+    """
     if name not in _core_modules:
         with _core_lock:
             if name not in _core_modules:
-                added = False
+                import importlib as _ilib
+
+                # Attempt 1: subpackage of hermes.core
                 try:
-                    if _CORE_DIR not in sys.path:
-                        sys.path.insert(0, _CORE_DIR)
-                        added = True
-                    _core_modules[name] = __import__(name)
-                except Exception as exc:
-                    # Check if already in sys.modules (imported as side effect)
-                    if name in sys.modules:
-                        _core_modules[name] = sys.modules[name]
-                    else:
-                        logger.debug("runtime: import %s failed: %s", name, exc)
-                        _core_modules[name] = None
-                finally:
-                    if added and _CORE_DIR in sys.path:
-                        sys.path.remove(_CORE_DIR)
+                    _core_modules[name] = _ilib.import_module(
+                        f"hermes.core.{name}"
+                    )
+                    return _core_modules[name]
+                except ImportError:
+                    pass
+
+                # Attempt 2: standalone module (sys.path already has _CORE_DIR)
+                try:
+                    _core_modules[name] = _ilib.import_module(name)
+                except ImportError as exc:
+                    logger.debug("runtime: import %s failed: %s", name, exc)
+                    _core_modules[name] = None
     return _core_modules[name]
 
 
@@ -80,12 +86,12 @@ def _get_kernel():
         try:
             return m.get_kernel()
         except Exception as exc:
-            logger.debug("runtime: _get_kernel: Check if already in sys.modules (imported as si: %s", exc)
+            logger.debug("runtime: _get_kernel: %s", exc)
     if m and hasattr(m, "AgentKernel"):
         try:
             return m.AgentKernel()
         except Exception as exc:
-            logger.debug("runtime: _get_kernel: Check if already in sys.modules (imported as si: %s", exc)
+            logger.debug("runtime: _get_kernel: %s", exc)
     return None
 
 
@@ -227,11 +233,16 @@ def _get_self_obs():
                 return m.get_self_observation()
             except Exception as exc:
                 logger.debug("runtime: _get_self_obs: %s", exc)
+        if hasattr(m, "get_observer"):
+            try:
+                return m.get_observer()
+            except Exception as exc:
+                logger.debug("runtime: _get_self_obs get_observer: %s", exc)
         if hasattr(m, "SelfObservationLoop"):
             try:
                 return m.SelfObservationLoop()
             except Exception as exc:
-                logger.debug("runtime: _get_self_obs: %s", exc)
+                logger.debug("runtime: _get_self_obs SelfObservationLoop: %s", exc)
     return None
 
 
@@ -431,6 +442,14 @@ class RuntimeHotPath:
                 self._self_obs.start()
         except Exception as exc:
             logger.debug("runtime: Start SelfObservation if available: %s", exc)
+
+        # Start Telemetry if available
+        try:
+            if self._telemetry and hasattr(self._telemetry, "start"):
+                self._telemetry.start()
+                logger.info("hermes-core: telemetry collection started")
+        except Exception as exc:
+            logger.debug("runtime: Start Telemetry if available: %s", exc)
 
     # ------------------------------------------------------------------
     # PUBLIC API — the one method the agent should call
@@ -649,7 +668,7 @@ class RuntimeHotPath:
                     },
                 )
         except Exception as exc:
-            logger.debug("runtime: ------------------------------------------------------------: %s", exc)
+            logger.debug("runtime: Kernel after_task: %s", exc)
 
         # --------------------------------------------------------------
         # STEP 10: DriftAnalyzer Observe (active defense)
@@ -666,8 +685,24 @@ class RuntimeHotPath:
                 if drift_report and drift_report.get("action_required"):
                     self._apply_active_defense(drift_report)
                     violations.append(f"drift_action: {drift_report.get('action', 'none')}")
+                    # Also feed back to PolicyEngine
+                    try:
+                        if self._policy is not None and hasattr(self._policy, "update_policy"):
+                            suggested = drift_report.get("suggested_actions", [])
+                            for s in suggested:
+                                part = s.split(":", 1)[0].strip()
+                                if part == "raise_threshold":
+                                    self._policy.update_policy("raise_threshold", adjust={"new_risk": "high"})
+                                elif part == "lower_threshold":
+                                    self._policy.update_policy("lower_threshold", adjust={"new_risk": "medium"})
+                                elif part == "throttle_eventbus":
+                                    self._policy.update_policy("tune_limit", adjust={"limit": "max_requests_per_domain", "value": 10})
+                                elif part == "reduce_concurrency":
+                                    self._policy.update_policy("tune_limit", adjust={"limit": "max_concurrent_tasks", "value": 1})
+                    except Exception as exc:
+                        logger.debug("runtime: drift→policy feedback: %s", exc)
         except Exception as exc:
-            logger.debug("runtime: If drift detected, trigger active defense: %s", exc)
+            logger.debug("runtime: DriftAnalyzer observe: %s", exc)
 
         # --------------------------------------------------------------
         # STEP 11: Learning Loop — Reflection → Experience → Preference
@@ -697,16 +732,6 @@ class RuntimeHotPath:
                     from datetime import datetime, timezone as _tz
                     _now = datetime.now(_tz.utc).isoformat()
                     _node_id = f"hp_{tool_id}"
-                    _graph_id = f"session_{ctx.get('session_id', 'default')}"
-                    if not hasattr(self, "_session_graph_id"):
-                        self._session_graph_id = None
-                    if self._session_graph_id is None:
-                        try:
-                            self._session_graph_id = self._task_graph.create_graph(
-                                name=_graph_id, nodes=[],
-                            )
-                        except Exception:
-                            self._session_graph_id = _graph_id
                     _node = _tg_mod.TaskNode(
                         node_id=_node_id,
                         action=tool_name,
@@ -718,7 +743,21 @@ class RuntimeHotPath:
                         started_at=_now,
                         completed_at=_now,
                     )
-                    self._task_graph.add_node(self._session_graph_id, _node)
+                    if not hasattr(self, "_session_graph_id"):
+                        self._session_graph_id = None
+                    if self._session_graph_id is None:
+                        _graph_id = f"session_{ctx.get('session_id', 'default')}"
+                        try:
+                            self._session_graph_id = self._task_graph.create_graph(
+                                name=_graph_id, nodes=[_node],
+                            )
+                        except Exception as exc:
+                            logger.debug("runtime: TaskGraph create_graph: %s", exc)
+                    else:
+                        try:
+                            self._task_graph.add_node(self._session_graph_id, _node)
+                        except Exception as exc:
+                            logger.debug("runtime: TaskGraph add_node: %s", exc)
         except Exception as exc:
             logger.debug("runtime: TaskGraph add_node: %s", exc)
 
@@ -857,7 +896,7 @@ class RuntimeHotPath:
                         if s is not None and s > 0:
                             return min(1.0, float(s))
         except Exception as exc:
-            logger.debug("runtime: _get_stability_score: --------------------------------------: %s", exc)
+            logger.debug("runtime: _get_stability_score: %s", exc)
         return 1.0  # default: assume stable when no data
 
     def _compute_behavior_controls(self, stability: float) -> Dict[str, Any]:
@@ -910,64 +949,72 @@ class RuntimeHotPath:
     # ------------------------------------------------------------------
 
     def _apply_active_defense(self, drift_report: Dict[str, Any]) -> None:
-        """Apply active defense actions based on drift analysis."""
-        action = drift_report.get("action", "none")
-        target = drift_report.get("target", "")
+        """Apply active defense actions based on drift analysis.
 
-        if action == "prune_memory" and self._memory is not None:
-            try:
-                if hasattr(self._memory, "prune"):
-                    self._memory.prune()
-                logger.info("runtime: active defense — pruned memory")
-            except Exception as exc:
-                logger.debug("runtime: active defense prune_memory: %s", exc)
+        Uses the ``suggested_actions`` list (new format from
+        ``DriftAnalyzer.analyze_all()``) to decide which subsystems
+        to adjust.  Each suggestion is a colon-delimited string::
 
-        elif action == "reset_planner_weights" and self._planner is not None:
-            try:
-                if hasattr(self._planner, "_strategy_preferences"):
-                    self._planner._strategy_preferences = []
-                if hasattr(self._planner, "_tool_preferences"):
-                    self._planner._tool_preferences = {}
-                # Remove persisted preferences file
-                _prefs_path = os.path.join(
-                    os.path.expanduser("~/.hermes/core/data"),
-                    "planner_preferences.json",
-                )
-                if os.path.exists(_prefs_path):
-                    os.remove(_prefs_path)
-                logger.info("runtime: active defense — reset planner weights + persisted prefs")
-            except Exception as exc:
-                logger.debug("runtime: active defense reset_planner_weights: %s", exc)
+            action_name: human-readable description
 
-        elif action == "throttle_eventbus":
-            try:
-                if self._event_bus is not None:
-                    if hasattr(self._event_bus, "set_rate_limit"):
-                        self._event_bus.set_rate_limit(max_events_per_second=5)
-                        logger.info("runtime: active defense — throttled EventBus via rate limit")
-                    else:
-                        logger.info("runtime: active defense — EventBus throttle skipped (no set_rate_limit)")
-            except Exception as exc:
-                logger.debug("runtime: active defense throttle_eventbus: %s", exc)
+        Supported actions:
 
-        elif action == "reduce_reflection_frequency" and self._reflection is not None:
-            # ReflectionEngine has no set_frequency(); log diagnostic instead
-            try:
-                stats = self._reflection.get_stats() if hasattr(self._reflection, "get_stats") else {}
-                logger.info(
-                    "runtime: active defense — reflection diagnostic (freq reduction unavailable): %s",
-                    stats,
-                )
-            except Exception as exc:
-                logger.debug("runtime: active defense reduce_reflection: %s", exc)
+        * ``prune_memory`` — call ``MemoryManager.prune()``
+        * ``reset_planner`` — clear planner strategy/tool preferences
+        * ``throttle_eventbus`` — rate-limit EventBus to 5 events/s
+        * ``reduce_reflection`` — log diagnostic (no set_frequency API yet)
+        * ``recovery`` — call ``Kernel.recover()``
+        """
+        suggested = drift_report.get("suggested_actions", [])
+        if not suggested:
+            # Fallback to old single-action format
+            old_action = drift_report.get("action", "")
+            if old_action:
+                suggested = [old_action]
 
-        elif action == "recovery" and self._kernel is not None:
+        for suggestion in suggested:
+            action_part = suggestion.split(":", 1)[0].strip()
             try:
-                if hasattr(self._kernel, "recover"):
-                    self._kernel.recover()
-                logger.info("runtime: active defense — triggered recovery")
+                if action_part == "prune_memory" and self._memory is not None:
+                    if hasattr(self._memory, "prune"):
+                        self._memory.prune()
+                    logger.info("runtime: active defense — pruned memory")
+
+                elif action_part == "reset_planner" and self._planner is not None:
+                    if hasattr(self._planner, "_strategy_preferences"):
+                        self._planner._strategy_preferences = []
+                    if hasattr(self._planner, "_tool_preferences"):
+                        self._planner._tool_preferences = {}
+                    _prefs_path = os.path.join(
+                        os.path.expanduser("~/.hermes/core/data"),
+                        "planner_preferences.json",
+                    )
+                    if os.path.exists(_prefs_path):
+                        os.remove(_prefs_path)
+                    logger.info("runtime: active defense — reset planner weights + persisted prefs")
+
+                elif action_part == "throttle_eventbus":
+                    if self._event_bus is not None:
+                        if hasattr(self._event_bus, "set_rate_limit"):
+                            self._event_bus.set_rate_limit(max_events_per_second=5)
+                            logger.info("runtime: active defense — throttled EventBus via rate limit")
+                        else:
+                            logger.info("runtime: active defense — EventBus throttle skipped (no set_rate_limit)")
+
+                elif action_part == "reduce_reflection" and self._reflection is not None:
+                    stats = self._reflection.get_stats() if hasattr(self._reflection, "get_stats") else {}
+                    logger.info(
+                        "runtime: active defense — reflection diagnostic (freq reduction unavailable): %s",
+                        stats,
+                    )
+
+                elif action_part == "recovery" and self._kernel is not None:
+                    if hasattr(self._kernel, "recover"):
+                        self._kernel.recover()
+                    logger.info("runtime: active defense — triggered recovery")
+
             except Exception as exc:
-                logger.debug("runtime: active defense recovery: %s", exc)
+                logger.debug("runtime: active defense '%s': %s", action_part, exc)
 
     # ------------------------------------------------------------------
     # Learning Loop — Reflection → Experience → Planner Preference
@@ -1016,7 +1063,7 @@ class RuntimeHotPath:
                     context=reflection_ctx,
                 )
         except Exception as exc:
-            logger.debug("runtime: --- 1. Reflection (now with memory context) ---: %s", exc)
+            logger.debug("runtime: Reflection reflect_on_task: %s", exc)
 
         # --- 2. Experience update with confidence (now with failure patterns) ---
         try:
@@ -1046,7 +1093,7 @@ class RuntimeHotPath:
                             error_message=error_msg,
                         )
         except Exception as exc:
-            logger.debug("runtime: Enrich failure with similar past failures: %s", exc)
+            logger.debug("runtime: Experience record_failure: %s", exc)
 
         # --- 3. Planner preference update (via ExperienceManager) ---
         try:
@@ -1055,7 +1102,6 @@ class RuntimeHotPath:
                 # Planner._select_tool() via exp.get_tool_stats()
                 self._experience.record_tool_usage(
                     tool_name=tool_name,
-                    domain=ctx.get("domain", "general"),
                     success=success,
                     duration_s=duration,
                 )
@@ -1094,7 +1140,7 @@ class RuntimeHotPath:
                     tags=[tool_name, "tool_execution"],
                 )
         except Exception as exc:
-            logger.debug("runtime: --- 4. Memory consolidation ---: %s", exc)
+            logger.debug("runtime: Memory remember_episode: %s", exc)
 
     # ------------------------------------------------------------------
     # EventBus publishing
@@ -1106,7 +1152,7 @@ class RuntimeHotPath:
             if self._event_bus is not None and hasattr(self._event_bus, "publish"):
                 self._event_bus.publish(event_type, data)
         except Exception as exc:
-            logger.debug("runtime: _publish_event: --------------------------------------------: %s", exc)
+            logger.debug("runtime: _publish_event: %s", exc)
 
     # ------------------------------------------------------------------
     # Task ID generation
@@ -1163,7 +1209,7 @@ class RuntimeHotPath:
                     k: round(v, 3) for k, v in self._planner._tool_preferences.items()
                 }
         except Exception as exc:
-            logger.debug("runtime: Include planner preferences if available: %s", exc)
+            logger.debug("runtime: planner preferences read: %s", exc)
 
         return output
 

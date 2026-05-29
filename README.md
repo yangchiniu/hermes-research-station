@@ -64,7 +64,7 @@
 | 模块 | 职责 | 关键设计 |
 |------|------|----------|
 | **Skill System** | 可扩展的能力插件 | 150+ 技能覆盖 MLOps、文献检索、网页抓取等 |
-| **hermes-core 插件** | 认知架构 | OODA 决策循环、任务规划器、事件溯源、运行时遥测 |
+| **hermes-core 插件** | 认知架构 | OODA 决策循环、任务规划器、事件溯源、运行时遥测、Watchdog 心跳、Goal 追踪、Drift 检测 |
 | **Scraping Gateway** | 多层抓取 | 5 层自动降级 + 质量评估 + 站点策略 |
 | **L3 CloakBrowser** | 隐身浏览器 | Chromium 指纹伪装 + 人类行为模拟 + 代理出口 |
 | **Delegation** | 子 Agent 编排 | delegate_task 并行执行、资源感知调度 |
@@ -93,7 +93,7 @@ hermes-research-station/
 │   ├── architecture.md    ← 技术架构详解
 │   └── changelog.md       ← 变更记录
 └── plugins/
-    └── hermes-core/       ← 认知插件 (审计修复后)
+    └── hermes-core/       ← 认知插件 (hooks/tools/runtime_integration)
 ```
 
 ---
@@ -104,14 +104,18 @@ hermes-research-station/
 - [x] Hermes Agent 核心运行稳定 (WSL2, 12h+ soak test)
 - [x] 多层抓取架构 L0-L3 已实现
 - [x] L3 引擎从 Edge CDP 迁移到 CloakBrowser (WSL原生)
-- [x] 认知插件 hermes-core 16/16 子系统加载 + 14 bug 修复
+- [x] 认知插件 hermes-core 28 子系统全部加载 + 4 模块已激活 (Telemetry/Watchdog/Goal/Drift)
+- [x] Planner LLM 分解支持 config.yaml + 代理 + 重试 (P0 修复)
+- [x] Goal 自动追踪 O(1) 精确匹配 + 反向索引 (P1 修复)
 - [x] 子 Agent 编排 soak test 通过（25 tasks, 0 failure）
 - [x] MiMo v2.5 Pro Token Plan 接入
 - [x] QQ Bot 即时通讯交互
 - [x] 10站真实采集评测 (B+ 评级)
+- [x] 项目评分 7.9/10 (架构9 代码8 激活8 健壮8 测试7 集成7 完整度8)
 
 **进行中**
 - [ ] L3 结构化提取器适配各站点 HTML
+- [ ] SQLite 线程安全改造 (check_same_thread)
 
 **规划中**
 - [ ] 文献调研自动化工作流

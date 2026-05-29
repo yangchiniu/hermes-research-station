@@ -15,7 +15,7 @@
 | 维度 | 原生 Hermes 状态 | 我们的增强 | 验证状态 |
 |------|-----------------|-----------|----------|
 | 上下文管理 | 看得见但看不全 | AGENTS.md 聚合 + references/ 按需加载 | ✅ 154 skills, token 节省 50-77% |
-| 工具系统 | 够用但零碎 | 16 子系统认知插件 + skill_router | ✅ 21,818 行, 16/16 子系统在线 |
+| 工具系统 | 够用但零碎 | 28 子系统认知插件 + skill_router | ✅ 19,506 行, 16/16 子系统在线, 4 模块已激活 |
 | 执行编排 | 最弱环节 | hermes-runtime Supervisor/Worker | ✅ 25 tasks soak test, 0% 失败率 |
 | 状态与记忆 | 做得好但容量有限 | 5 层记忆 + 4 SQLite 持久化 | ✅ 跨会话持久性已验证 |
 | 评估与观测 | 几乎是盲的 | 遥测 + 漂移分析 + 反思引擎 | ✅ 12h 稳定性测试全绿 |
@@ -48,37 +48,42 @@ Tool Call → RuntimeHotPath.execute_tool()
   └── EventBus.publish()                   ← 事件广播
 ```
 
-### 模块清单 (27 模块, 21,818 行)
+### 模块清单 (28 模块, 19,506 行)
 
-| 模块 | 行数 | 职责 |
-|------|------|------|
-| kernel.py | 1,300 | 编排器：12 子系统的 pre/post-task 管道 |
-| planner.py | 1,822 | 目标分解 → 工具选择 → 约束推理 → 风险评估 |
-| ooda_loop.py | 983 | Observe → Orient → Decide → Act 自主循环 |
-| event_bus.py | 935 | 20+ 事件类型、线程安全、死信队列、限速、去重 |
-| policy_engine.py | 897 | 5 层安全检查：禁止 → 风险 → 工具 → 域 → 资源 |
-| world_model.py | 968 | CPU/RAM/Disk/网络/浏览器实时快照 + DB 持久化 |
-| tool_registry.py | 589 | 能力注册表：风险/成本/认证分级 |
-| reflection_engine.py | 649 | 错误分析 + 改进建议 + 模式提取 |
-| experience_manager.py | 1,219 | 成功/失败模式追踪、置信度衰减、最优工具推荐 |
-| memory_manager.py | 1,544 | 5 层记忆：working/episodic/semantic/procedural/environment |
-| drift_analyzer.py | 992 | 5 维度加权漂移检测 + 自动防御 |
-| watchdog.py | 762 | 死锁/活锁/Event Storm/递归规划检测 |
-| goal_manager.py | 723 | 6 级优先级仲裁 (RECOVERY=100 → IDLE=0) |
-| runtime_supervisor.py | 740 | 30 秒资源监控循环、阈值告警 |
-| self_observation.py | 543 | 5 分钟周期自观察 + 自动告警 |
-| task_graph.py | 836 | DAG 引擎：依赖解析/并行批次/重试/checkpoint/回滚 |
-| telemetry.py | 816 | 60 秒周期采集、认知稳定性评分 |
-| state_manager.py | - | 状态快照 capture/restore/diff/cleanup |
-| recovery_manager.py | 1,032 | 崩溃恢复：健康检查 + 任务恢复 + 会话抢救 |
-| event_logger.py | - | NDJSON 追加式事件日志（线程安全，自动轮转 100MB） |
-| db_schema.py | - | 3 个 SQLite 库的 Schema 管理（WAL 模式） |
-| runtime_integration.py | 1,050 | 桥接层：将所有子系统接入 execute_tool() 热路径 |
-| hooks.py | - | 生命周期钩子：session_start/end, tool_call, llm_call |
-| tools.py | - | 6 个 LLM 工具 + 2 个 slash 命令的 handler |
-| exceptions.py | - | 9 种异常类的继承体系 |
-| cli.py | - | 16 个 CLI 命令 (init/status/health/snapshot/...) |
-| config/policy.yaml | - | 策略配置：禁止动作、阈值、域规则 |
+| 模块 | 行数 | 职责 | 状态 |
+|------|------|------|------|
+| planner.py | 1,485 | 目标分解 → 工具选择 → 约束推理 → 风险评估 | ✅ 含 LLM 分解 + 重试/代理 |
+| kernel.py | 805 | 编排器：12 子系统的 pre/post-task 管道 | ✅ |
+| world_model.py | 968 | CPU/RAM/Disk/网络/浏览器实时快照 + DB 持久化 | ✅ |
+| memory_manager.py | 941 | 5 层记忆：working/episodic/semantic/procedural/environment | ✅ |
+| task_graph.py | 836 | DAG 引擎：依赖解析/并行批次/重试/checkpoint/回滚 | ✅ |
+| telemetry_replay.py | 817 | 遥测回放：历史指标验证与调试 | ✅ |
+| policy_engine.py | 713 | 5 层安全检查：禁止 → 风险 → 工具 → 域 → 资源 | ✅ |
+| field_runner.py | 710 | 现场测试执行器 | ✅ |
+| experience_manager.py | 693 | 成功/失败模式追踪、置信度衰减、最优工具推荐 | ✅ |
+| drift_analyzer.py | 652 | 5 维度加权漂移检测 + 自动防御 | ✅ **已激活** (10% 采样) |
+| recovery_manager.py | 646 | 崩溃恢复：健康检查 + 任务恢复 + 会话抢救 | ✅ |
+| reflection_engine.py | 645 | 错误分析 + 改进建议 + 模式提取 | ✅ |
+| event_bus.py | 634 | 20+ 事件类型、线程安全、死信队列、限速、去重 | ✅ |
+| ooda_loop.py | 617 | Observe → Orient → Decide → Act 自主循环 | ✅ |
+| tool_registry.py | 589 | 能力注册表：风险/成本/认证分级 | ✅ |
+| telemetry.py | 558 | 60 秒周期采集、认知稳定性评分 | ✅ **已激活** (Daemon 运行中) |
+| runtime_supervisor.py | 488 | 30 秒资源监控循环、阈值告警 | ✅ |
+| goal_manager.py | 488 | 6 级优先级仲裁 (RECOVERY=100 → IDLE=0) | ✅ **已激活** (自动追踪工具调用) |
+| watchdog.py | 466 | 死锁/活锁/Event Storm/递归规划检测 | ✅ **已激活** (每次工具调用心跳) |
+| state_manager.py | 461 | 状态快照 capture/restore/diff/cleanup | ✅ |
+| semantic_retrieval.py | 435 | 语义检索（基于子串匹配） | ✅ |
+| db_schema.py | 411 | SQLite Schema 管理（WAL 模式） | ✅ |
+| self_observation.py | 387 | 5 分钟周期自观察 + 自动告警 | ✅ |
+| cli.py | 346 | 16 个 CLI 命令 (init/status/health/snapshot/...) | ✅ |
+| plan_executor.py | 297 | 计划执行器 | ✅ |
+| event_logger.py | 280 | NDJSON 追加式事件日志（线程安全，自动轮转 100MB） | ✅ |
+| __init__.py | 214 | 包导出：18 个 _LazyModule + 12 个便利函数 | ✅ |
+| exceptions.py | 111 | 9 种异常类的继承体系 | ✅ |
+| *runtime_integration.py* | 1,250 | 桥接层：14 步 execute_tool() 热路径管线 | ✅ |
+| *hooks.py* | 736 | 生命周期钩子：session_start/end, tool_call, llm_call | ✅ |
+| *tools.py* | 503 | 6 个 LLM 工具 + 2 个 slash 命令 handler | ✅ |
+| *plugin.yaml* | — | 插件元数据：5 hooks + 2 commands | ✅ |
 
 ### 稳定性 → 行为控制 (Homeostasis)
 
@@ -284,7 +289,7 @@ L3 层的独特价值：CloakBrowser 基于 Chromium 隐身引擎，每次启动
 ## 已知限制
 
 1. 标准 Hermes 工具（terminal/read_file/write_file）不经过 RuntimeHotPath — 只有 hermes-core 注册的工具走完整管道
-2. OODA Loop 已修复但未在真实对话中长时间运行
-3. 语义检索仍是 substring 匹配，没有 embedding
-4. 认知稳定性评分已采集但未主动驱动自动降级
+2. 语义检索仍是 substring 匹配，没有 embedding（已规划，等待 embedding 模型就绪）
+3. 认知稳定性评分已采集但未主动驱动自动降级（评分逻辑可用，控制回路待接入）
+4. SQLite `check_same_thread=True` 限制 — 多线程场景需 thread-local storage 改造
 5. hermes-runtime 的 Reviewer 层未实现
